@@ -29,7 +29,6 @@ local State = {
     
     -- Mouse and interaction
     mouse_pos = {x = 0, y = 0},
-    last_mouse_pos = {x = 0, y = 0},
     is_dragging = false,
     drag_mode = "sculpt",
     drag_start_pos = {x = 0, y = 0},
@@ -42,6 +41,9 @@ local State = {
     cached_envelope = nil,
     envelope_detected = false,
     validation_failures = 0,
+    
+    -- Cached envelope properties
+    cached_envelope_properties = {envelope = nil, min_val = 0, max_val = 1},
     
     -- Undo system
     undo_active = false,
@@ -59,6 +61,25 @@ end
 
 local function clamp(value, min_val, max_val)
     return math.max(min_val, math.min(max_val, value))
+end
+
+local function get_envelope_properties(envelope)
+    if not envelope then return nil, nil end
+    
+    if State.cached_envelope_properties.envelope == envelope then
+        return State.cached_envelope_properties.min_val, State.cached_envelope_properties.max_val
+    end
+    
+    local br_env = reaper.BR_EnvAlloc(envelope, false)
+    if not br_env then return nil, nil end
+    local _, _, _, _, _, _, min_val, max_val = reaper.BR_EnvGetProperties(br_env)
+    reaper.BR_EnvFree(br_env, false)
+    
+    State.cached_envelope_properties.envelope = envelope
+    State.cached_envelope_properties.min_val = min_val
+    State.cached_envelope_properties.max_val = max_val
+    
+    return min_val, max_val
 end
 
 
@@ -88,10 +109,8 @@ local function screen_to_envelope(screen_x, screen_y, envelope)
     local project_time = arrange_start + time_ratio * (arrange_end - arrange_start)
     
     -- Get envelope properties
-    local br_env = reaper.BR_EnvAlloc(envelope, false)
-    if not br_env then return nil, nil end
-    local active, visible, armed, in_lane, lane_height, default_shape, min_val, max_val = reaper.BR_EnvGetProperties(br_env)
-    reaper.BR_EnvFree(br_env, false)
+    local min_val, max_val = get_envelope_properties(envelope)
+    if not min_val then return nil, nil end
     
     -- Convert screen Y to envelope value
     local envelope_range = bounds.bottom - bounds.top
@@ -112,10 +131,8 @@ local function envelope_to_screen(project_time, envelope_value, envelope)
     local screen_x = bounds.left + time_ratio * (bounds.right - bounds.left)
     
     -- Get envelope properties
-    local br_env = reaper.BR_EnvAlloc(envelope, false)
-    if not br_env then return nil, nil end
-    local active, visible, armed, in_lane, lane_height, default_shape, min_val, max_val = reaper.BR_EnvGetProperties(br_env)
-    reaper.BR_EnvFree(br_env, false)
+    local min_val, max_val = get_envelope_properties(envelope)
+    if not min_val then return nil, nil end
     
     -- Convert envelope value to screen Y
     local value_ratio = (max_val - envelope_value) / (max_val - min_val)
@@ -146,8 +163,8 @@ local function validate_cached_envelope()
     if not retval then return false end
     
     -- Quick check: is mouse still over envelope area
-    local window, segment, details = reaper.BR_GetMouseCursorContext()
-    local envelope, istakeEnvelope = reaper.BR_GetMouseCursorContext_Envelope()
+    local _ = reaper.BR_GetMouseCursorContext()
+    local envelope = reaper.BR_GetMouseCursorContext_Envelope()
     
     -- Check if we're still over the same envelope
     local still_valid = (envelope == State.cached_envelope)
@@ -157,8 +174,9 @@ local function validate_cached_envelope()
         return true
     else
         State.validation_failures = State.validation_failures + 1
-        -- Only invalidate after multiple consecutive failures (tolerance)
-        return State.validation_failures < 3
+        -- Use progressive tolerance: allow more failures before invalidating
+        local failure_threshold = 3 + math.floor(State.validation_failures / 2)
+        return State.validation_failures < math.min(failure_threshold, 10)
     end
 end
 
@@ -175,12 +193,13 @@ local function detect_envelope()
             State.overlay_visible = false
             State.envelope_detected = false
             State.validation_failures = 0
+            State.cached_envelope_properties.envelope = nil
         end
     end
     
     -- No cached envelope or cache was invalid - detect new one
-    local window, segment, details = reaper.BR_GetMouseCursorContext()
-    local envelope, istakeEnvelope = reaper.BR_GetMouseCursorContext_Envelope()
+    local _ = reaper.BR_GetMouseCursorContext()
+    local envelope = reaper.BR_GetMouseCursorContext_Envelope()
     
     local envelope_found = (envelope ~= nil)
     
@@ -234,10 +253,8 @@ local function sculpt_captured_points(captured_points, delta_x, delta_y, envelop
     if not envelope or #captured_points == 0 then return 0 end
     
     -- Get envelope properties
-    local br_env = reaper.BR_EnvAlloc(envelope, false)
-    if not br_env then return 0 end
-    local active, visible, armed, in_lane, lane_height, default_shape, min_val, max_val = reaper.BR_EnvGetProperties(br_env)
-    reaper.BR_EnvFree(br_env, false)
+    local min_val, max_val = get_envelope_properties(envelope)
+    if not min_val then return 0 end
     
     -- Convert pixel deltas to time/value deltas
     local arrange_start, arrange_end = reaper.GetSet_ArrangeView2(0, false, 0, 0)
@@ -556,7 +573,6 @@ end
 local function main_loop()
     -- Update mouse position (use raw coordinates for REAPER functions)
     local mouse_x, mouse_y = reaper.GetMousePosition()
-    State.last_mouse_pos = {x = State.mouse_pos.x, y = State.mouse_pos.y}
     State.mouse_pos = {x = mouse_x, y = mouse_y}
     
     -- Detect envelope
