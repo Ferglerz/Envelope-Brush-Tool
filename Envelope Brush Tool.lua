@@ -166,17 +166,16 @@ local function validate_cached_envelope()
     local _ = reaper.BR_GetMouseCursorContext()
     local envelope = reaper.BR_GetMouseCursorContext_Envelope()
     
-    -- Check if we're still over the same envelope
-    local still_valid = (envelope == State.cached_envelope)
-    
-    if still_valid then
-        State.validation_failures = 0  -- Reset failure count on success
+    -- If we detect any envelope (even if different), consider cached envelope still valid
+    -- This prevents flickering when BR_GetMouseCursorContext_Envelope() returns inconsistent results
+    if envelope then
+        State.validation_failures = 0  -- Reset failure count when any envelope is detected
         return true
     else
+        -- Only increment failures when no envelope is detected at all
         State.validation_failures = State.validation_failures + 1
-        -- Use progressive tolerance: allow more failures before invalidating
-        local failure_threshold = 3 + math.floor(State.validation_failures / 2)
-        return State.validation_failures < math.min(failure_threshold, 10)
+        -- Use much higher tolerance - only invalidate after many consecutive failures
+        return State.validation_failures < 15
     end
 end
 
