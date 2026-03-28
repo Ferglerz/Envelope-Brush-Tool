@@ -9,6 +9,7 @@ local CONFIG = {
     MAX_BRUSH_SIZE = 200,
     BRUSH_SIZE_STEP = 5,
     FALLOFF_TYPES = {"exponential", "linear", "inverse_exponential"},
+    SCULPT_MODES = {"grab", "smooth"},
     DEFAULT_FALLOFF_STRENGTH = 1.0,
     MIN_FALLOFF_STRENGTH = 0.1,
     MAX_FALLOFF_STRENGTH = 3.0,
@@ -18,6 +19,10 @@ local CONFIG = {
     INNER_CIRCLE_COLOR = 0xFFFFFF66,
     CIRCLE_THICKNESS = 2.0,
     MIN_MOVEMENT_THRESHOLD = 0.5,
+    -- Smooth sculpt: blend per step toward Envelope_Evaluate at each point's time
+    DEFAULT_SMOOTH_STRENGTH = 0.2,
+    MIN_SMOOTH_STRENGTH = 0.02,
+    MAX_SMOOTH_STRENGTH = 1.0,
 }
 
 -- ===== STATE =====
@@ -26,6 +31,10 @@ local State = {
     brush_size = CONFIG.DEFAULT_BRUSH_SIZE,
     falloff_type = 1,
     falloff_strength = CONFIG.DEFAULT_FALLOFF_STRENGTH,
+    sculpt_mode = 1,
+    smooth_strength = CONFIG.DEFAULT_SMOOTH_STRENGTH,
+    lock_time_axis = false,
+    lock_value_axis = false,
 
     -- Mode: false = LMB sculpts existing points; true = LMB drag creates points
     add_points_mode = false,
@@ -338,15 +347,39 @@ local function sculpt_captured_points(captured_points, delta_x, delta_y, envelop
     local pixel_height = bounds.bottom - bounds.top
     if pixel_width <= 0 or pixel_height <= 0 then return 0 end
 
+    local mode_name = CONFIG.SCULPT_MODES[State.sculpt_mode] or "grab"
     local delta_time = (delta_x / pixel_width) * time_range
     local value_range = max_val - min_val
     local delta_value = -(delta_y / pixel_height) * value_range
 
+    if State.lock_time_axis then delta_time = 0 end
+    if State.lock_value_axis then delta_value = 0 end
+
     local points_moved = 0
+    local eps_t = math.abs(time_range) * (State.brush_size / math.max(pixel_width, 1)) * 0.06
+    if eps_t < 1e-9 then eps_t = 1e-6 end
 
     for _, point_info in ipairs(captured_points) do
-        local new_time = point_info.original_time + (delta_time * point_info.falloff_strength)
-        local new_value = clamp(point_info.original_value + (delta_value * point_info.falloff_strength), min_val, max_val)
+        local f = point_info.falloff_strength
+        local new_time = point_info.original_time
+        local new_value = point_info.original_value
+
+        if mode_name == "smooth" then
+            if not State.lock_value_axis then
+                local t0 = point_info.original_time
+                local vm = reaper.Envelope_Evaluate(envelope, t0 - eps_t, 0, 0)
+                local vp = reaper.Envelope_Evaluate(envelope, t0 + eps_t, 0, 0)
+                local target_v = (vm + vp) * 0.5
+                local step = clamp(State.smooth_strength, 0, 1) * f
+                new_value = clamp(point_info.original_value + (target_v - point_info.original_value) * step, min_val, max_val)
+            end
+            if not State.lock_time_axis then
+                new_time = point_info.original_time + (delta_time * f)
+            end
+        else
+            new_time = point_info.original_time + (delta_time * f)
+            new_value = clamp(point_info.original_value + (delta_value * f), min_val, max_val)
+        end
 
         reaper.SetEnvelopePoint(envelope, point_info.index, new_time, new_value,
             point_info.original_shape, point_info.original_tension,
@@ -474,9 +507,9 @@ local function render_brush_overlay(client_mouse_x, client_mouse_y)
 
             reaper.ImGui_DrawList_AddCircleFilled(draw_list, mouse_x, mouse_y, 3, 0xFF00FFFF)
 
-            local mode_label = State.add_points_mode and "add" or "sculpt"
+            local mode_label = State.add_points_mode and "add" or (CONFIG.SCULPT_MODES[State.sculpt_mode] or "grab")
             local text_x = mouse_x + radius + 10
-            reaper.ImGui_DrawList_AddText(draw_list, text_x, mouse_y - 30, 0xFFFFFFFF, mode_label)
+            reaper.ImGui_DrawList_AddText(draw_list, text_x, mouse_y - 40, 0xFFFFFFFF, mode_label)
             reaper.ImGui_DrawList_AddText(draw_list, text_x, mouse_y - 20, 0xFFFFFFFF, CONFIG.FALLOFF_TYPES[State.falloff_type])
             reaper.ImGui_DrawList_AddText(draw_list, text_x, mouse_y, 0xFFFFFFFF, "Size: " .. State.brush_size)
         end
@@ -580,7 +613,8 @@ local function try_apply_sculpt_drag(mx, my)
         return
     end
 
-    begin_undo_once("Brush Sculpt Envelope")
+    local undo_name = (CONFIG.SCULPT_MODES[State.sculpt_mode] == "smooth") and "Brush Smooth Envelope" or "Brush Sculpt Envelope"
+    begin_undo_once(undo_name)
     sculpt_captured_points(State.captured_points, dx, dy, State.target_envelope, true)
     refresh_captured_from_envelope(State.target_envelope)
     State.sculpt_last_client = { x = mx, y = my }
@@ -645,7 +679,7 @@ local function manual_start_sculpt()
     if #State.captured_points > 0 then
         reaper.Undo_BeginBlock()
         State.undo_active = true
-        State.undo_operation_name = "Brush Sculpt Envelope"
+        State.undo_operation_name = (CONFIG.SCULPT_MODES[State.sculpt_mode] == "smooth") and "Brush Smooth Envelope" or "Brush Sculpt Envelope"
     end
 end
 
@@ -672,6 +706,19 @@ local function draw_control_window()
         local falloff_names = table.concat(CONFIG.FALLOFF_TYPES, "\0") .. "\0"
         local falloff_changed, new_falloff = reaper.ImGui_Combo(State.ctx, "Falloff Type", State.falloff_type - 1, falloff_names)
         if falloff_changed then State.falloff_type = new_falloff + 1 end
+
+        local sculpt_names = table.concat(CONFIG.SCULPT_MODES, "\0") .. "\0"
+        local sculpt_changed, new_sculpt = reaper.ImGui_Combo(State.ctx, "Sculpt mode", State.sculpt_mode - 1, sculpt_names)
+        if sculpt_changed then State.sculpt_mode = new_sculpt + 1 end
+
+        local sm = CONFIG.SCULPT_MODES[State.sculpt_mode] or "grab"
+        if sm == "smooth" then
+            local sm_ch, sm_v = reaper.ImGui_SliderDouble(State.ctx, "Smooth strength", State.smooth_strength, CONFIG.MIN_SMOOTH_STRENGTH, CONFIG.MAX_SMOOTH_STRENGTH, "%.2f")
+            if sm_ch then State.smooth_strength = sm_v end
+        end
+
+        _, State.lock_time_axis = reaper.ImGui_Checkbox(State.ctx, "Lock time (horizontal)", State.lock_time_axis)
+        _, State.lock_value_axis = reaper.ImGui_Checkbox(State.ctx, "Lock value (vertical)", State.lock_value_axis)
 
         local add_changed, add_val = reaper.ImGui_Checkbox(State.ctx, "Add points (LMB drag)", State.add_points_mode)
         if add_changed then State.add_points_mode = add_val end
@@ -705,6 +752,8 @@ local function draw_control_window()
         end
         reaper.ImGui_BulletText(State.ctx, "Scroll: brush size; Shift+Scroll: falloff strength")
         reaper.ImGui_BulletText(State.ctx, "Tab: cycle falloff types")
+        reaper.ImGui_BulletText(State.ctx, "Grab: move points; Smooth: relax toward local average (falloff-weighted)")
+        reaper.ImGui_BulletText(State.ctx, "Axis locks: edit only time or only value")
 
         reaper.ImGui_Separator(State.ctx)
 
