@@ -80,16 +80,26 @@ local function begin_undo_once(state, name)
     end
 end
 
-function M.end_drag_operation(state)
+--- opts.focus_arrange: optional function() before Envelope_SortPoints (unused; focus steal was disruptive).
+function M.end_drag_operation(state, opts)
     if not state.is_dragging then return end
 
+    state.envelope_flush_pending = false
     state.is_dragging = false
     state.captured_points = {}
     state.last_create_client = nil
     state.sculpt_last_client = nil
 
     if state.sculpt_sort_pending and state.target_envelope then
-        reaper.Envelope_SortPoints(state.target_envelope)
+        if opts and opts.focus_arrange then
+            opts.focus_arrange()
+        end
+        local ai = state.envelope_autoitem_idx or -1
+        if ai >= 0 and reaper.Envelope_SortPointsEx then
+            reaper.Envelope_SortPointsEx(state.target_envelope, ai)
+        else
+            reaper.Envelope_SortPoints(state.target_envelope)
+        end
         reaper.UpdateArrange()
         state.sculpt_sort_pending = false
     end
@@ -105,6 +115,9 @@ function M.clear_envelope_target(state, end_drag_operation)
     end_drag_operation()
     state.cached_envelope = nil
     state.target_envelope = nil
+    state.envelope_autoitem_idx = -1
+    state.envelope_flush_pending = false
+    state.suppress_imgui_control_this_frame = false
     state.overlay_visible = false
     state.envelope_detected = false
     state.cached_envelope_properties.envelope = nil
@@ -154,9 +167,19 @@ function M.handle_keyboard_input(state, deps)
     return false
 end
 
+local function sculpt_delta_below_threshold(dx, dy, config)
+    local t = config.SCULPT_DRAG_MIN_MOVEMENT_PX or 0.02
+    return (dx * dx + dy * dy) < (t * t)
+end
+
 function M.try_apply_sculpt_drag(state, config, mx, my, deps)
     if not state.target_envelope or state.drag_mode ~= "sculpt" then return end
-    if #state.captured_points == 0 then return end
+
+    state.captured_points = deps.capture_points_in_radius(mx, my, state.brush_size, state.target_envelope)
+    if #state.captured_points == 0 then
+        state.sculpt_last_client = { x = mx, y = my }
+        return
+    end
 
     if not state.sculpt_last_client then
         state.sculpt_last_client = { x = state.drag_start_pos.x, y = state.drag_start_pos.y }
@@ -164,7 +187,7 @@ function M.try_apply_sculpt_drag(state, config, mx, my, deps)
 
     local dx = mx - state.sculpt_last_client.x
     local dy = my - state.sculpt_last_client.y
-    if math.sqrt(dx * dx + dy * dy) < config.MIN_MOVEMENT_THRESHOLD then
+    if sculpt_delta_below_threshold(dx, dy, config) then
         return
     end
 
@@ -192,17 +215,9 @@ function M.try_apply_add_drag(state, config, mx, my, deps)
     end
 end
 
---- LMB drag: add points along stroke (min spacing) and sculpt points under the brush each step.
+--- LMB drag (grab / combined): points are seeded on press only; drag only sculpts under the brush.
 function M.try_combined_drag(state, config, mx, my, deps)
     if not state.target_envelope or state.drag_mode ~= "combined" then return end
-
-    if not state.last_create_client or deps.get_distance(mx, my, state.last_create_client.x, state.last_create_client.y) >= config.MIN_POINT_SPACING_PIXELS then
-        local n = deps.create_points_in_brush_area(mx, my, state.brush_size, state.target_envelope)
-        if n > 0 then
-            begin_undo_once(state, "Brush Drag Envelope")
-            state.last_create_client = { x = mx, y = my }
-        end
-    end
 
     state.captured_points = deps.capture_points_in_radius(mx, my, state.brush_size, state.target_envelope)
 
@@ -212,7 +227,7 @@ function M.try_combined_drag(state, config, mx, my, deps)
 
     local dx = mx - state.sculpt_last_client.x
     local dy = my - state.sculpt_last_client.y
-    if math.sqrt(dx * dx + dy * dy) < config.MIN_MOVEMENT_THRESHOLD then
+    if sculpt_delta_below_threshold(dx, dy, config) then
         return
     end
 
@@ -229,20 +244,25 @@ function M.on_lmb_pressed(state, config, mx, my, deps)
     if not state.target_envelope then return end
 
     state.is_dragging = true
-    state.drag_mode = "combined"
+    local smooth = (config.SCULPT_MODES[state.sculpt_mode] == "smooth")
+    state.drag_mode = smooth and "sculpt" or "combined"
     state.drag_start_pos = { x = mx, y = my }
     state.last_create_client = nil
     state.sculpt_sort_pending = false
     state.sculpt_last_client = { x = mx, y = my }
 
-    state.captured_points = deps.capture_points_in_radius(mx, my, state.brush_size, state.target_envelope)
-    local n = deps.create_points_in_brush_area(mx, my, state.brush_size, state.target_envelope)
+    if smooth then
+        state.captured_points = deps.capture_points_in_radius(mx, my, state.brush_size, state.target_envelope)
+        return
+    end
+
+    local n = deps.seed_brush_width_at_client(mx, my)
     if n > 0 then
         reaper.Undo_BeginBlock()
         state.undo_active = true
         state.undo_operation_name = "Brush Drag Envelope"
-        state.last_create_client = { x = mx, y = my }
     end
+    state.captured_points = deps.capture_points_in_radius(mx, my, state.brush_size, state.target_envelope)
 end
 
 return M

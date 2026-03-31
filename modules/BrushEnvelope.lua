@@ -73,18 +73,24 @@ function M.setup_envelope_bounds(state, config, get_arrange_hwnd)
     if not arrange then return false end
     local retval, left, top, right, bottom = reaper.JS_Window_GetClientRect(arrange)
     if not retval then return false end
+    -- macOS / some SWELL builds can return top>bottom or left>right; negative height breaks mapping.
+    local l, r = math.min(left, right), math.max(left, right)
+    local t, b = math.min(top, bottom), math.max(top, bottom)
 
-    state.envelope_bounds.left = left + 2
-    state.envelope_bounds.right = right - 2
-    state.envelope_bounds.top = top + config.ARRANGE_RULER_INSET
-    state.envelope_bounds.bottom = bottom - 2
-    state.client_w = math.max(1, right - left)
-    state.client_h = math.max(1, bottom - top)
+    state.envelope_bounds.left = l + 2
+    state.envelope_bounds.right = r - 2
+    state.envelope_bounds.top = t + config.ARRANGE_RULER_INSET
+    state.envelope_bounds.bottom = b - 2
+    if state.envelope_bounds.top >= state.envelope_bounds.bottom then
+        state.envelope_bounds.top, state.envelope_bounds.bottom = t, b
+    end
+    state.client_w = math.max(1, r - l)
+    state.client_h = math.max(1, b - t)
     return true
 end
 
-function M.point_hits_envelope_curve(state, config, envelope_to_screen, envelope, mx, my)
-    if not envelope then return false end
+function M.point_hits_envelope_curve(state, config, envelope_to_screen, envelope, mx, my, value_at_time)
+    if not envelope or not value_at_time then return false end
 
     local bounds = state.envelope_bounds
     if mx < bounds.left or mx > bounds.right or my < bounds.top or my > bounds.bottom then
@@ -98,7 +104,8 @@ function M.point_hits_envelope_curve(state, config, envelope_to_screen, envelope
     end
 
     local t = state.frame_arrange_start + ((mx - bounds.left) / pixel_width) * time_range
-    local v = reaper.Envelope_Evaluate(envelope, t, 0, 0)
+    local v = value_at_time(envelope, t)
+    if v == nil then return false end
     local _, sy = envelope_to_screen(t, v, envelope)
     if not sy then return false end
 
@@ -107,10 +114,22 @@ end
 
 function M.detect_envelope(state, deps)
     reaper.BR_GetMouseCursorContext()
-    local hit = reaper.BR_GetMouseCursorContext_Envelope()
+    local hit, hover_ai = nil, -1
+    if reaper.BR_GetMouseCursorContext_EnvelopeEx then
+        -- C API: envelope, take_envelope, automation_item_id, point_id_under_cursor
+        hit, _, hover_ai = reaper.BR_GetMouseCursorContext_EnvelopeEx()
+        if type(hover_ai) ~= "number" or hover_ai < 0 then
+            hover_ai = -1
+        else
+            hover_ai = math.floor(hover_ai)
+        end
+    else
+        hit = reaper.BR_GetMouseCursorContext_Envelope()
+    end
     state.sws_hover_detected = (hit ~= nil)
 
-    if state.target_envelope and not deps.is_envelope_lane_visible(state.target_envelope) then
+    -- While LMB brush-drag is active, keep the locked lane even if SWS hover / lane-visible flickers off.
+    if state.target_envelope and not deps.is_envelope_lane_visible(state.target_envelope) and not state.is_dragging then
         deps.clear_target_envelope_state_only()
     end
 
@@ -120,6 +139,7 @@ function M.detect_envelope(state, deps)
         end
         state.target_envelope = hit
         state.cached_envelope = hit
+        state.envelope_autoitem_idx = hover_ai
         deps.setup_envelope_bounds()
     elseif state.target_envelope then
         local ok_name = reaper.GetEnvelopeName(state.target_envelope)

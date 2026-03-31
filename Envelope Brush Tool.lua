@@ -54,19 +54,70 @@ local function init()
         return false
     end
 
-    if not Core.ensure_wheel_intercept(State) then
-        reaper.ShowMessageBox("Could not intercept mouse wheel on the arrange view (js_ReaScriptAPI).", "Wheel Intercept Failed", 0)
+    if not Core.ensure_arrange_intercepts(State) then
+        reaper.ShowMessageBox("Could not intercept arrange view input (wheel / mouse buttons) via js_ReaScriptAPI.", "Arrange Intercept Failed", 0)
         return false
     end
 
     return true
 end
 
+--- Runs at the start of a defer tick (after REAPER/ImGui yielded). Mouse is sampled again here.
+local function run_pending_envelope_flush()
+    if not State.envelope_flush_pending then
+        return
+    end
+    State.envelope_flush_pending = false
+
+    if not State.target_envelope or not Core.is_lmb_down_js() then
+        return
+    end
+
+    if reaper.PreventUIRefresh then
+        reaper.PreventUIRefresh(1)
+    end
+
+    local mx, my = D.get_mouse_client_xy()
+    if mx and my then
+        if CONFIG.DEFER_ENVELOPE_SUPPRESS_CONTROL_IMGUI then
+            State.suppress_imgui_control_this_frame = true
+        end
+        if not State.is_dragging then
+            Input.on_lmb_pressed(State, CONFIG, mx, my, {
+                seed_brush_width_at_client = D.seed_brush_width_at_client,
+                capture_points_in_radius = D.capture_points_in_radius,
+            })
+        elseif State.drag_mode == "sculpt" then
+            Input.try_apply_sculpt_drag(State, CONFIG, mx, my, {
+                capture_points_in_radius = D.capture_points_in_radius,
+                sculpt_captured_points = D.sculpt_captured_points,
+                refresh_captured_from_envelope = D.refresh_captured_from_envelope,
+            })
+        elseif State.drag_mode == "combined" then
+            Input.try_combined_drag(State, CONFIG, mx, my, {
+                capture_points_in_radius = D.capture_points_in_radius,
+                sculpt_captured_points = D.sculpt_captured_points,
+                refresh_captured_from_envelope = D.refresh_captured_from_envelope,
+            })
+        end
+    end
+
+    if reaper.PreventUIRefresh then
+        reaper.PreventUIRefresh(-1)
+    end
+    reaper.UpdateArrange()
+end
+
 local function on_script_close()
-    Core.release_wheel_intercept(State)
+    Core.release_arrange_intercepts(State)
     if State.undo_active then
         if State.sculpt_sort_pending and State.target_envelope then
-            reaper.Envelope_SortPoints(State.target_envelope)
+            local ai = State.envelope_autoitem_idx or -1
+            if ai >= 0 and reaper.Envelope_SortPointsEx then
+                reaper.Envelope_SortPointsEx(State.target_envelope, ai)
+            else
+                reaper.Envelope_SortPoints(State.target_envelope)
+            end
         end
         reaper.Undo_EndBlock(State.undo_operation_name, -1)
     end
@@ -94,11 +145,83 @@ local function main_loop()
         point_hits_envelope_curve = D.point_hits_envelope_curve,
     })
 
-    local open = UI.draw_control_window(State, CONFIG, {
-        create_points_in_brush_area = D.create_points_in_brush_area,
-        get_mouse_client_xy = D.get_mouse_client_xy,
-        brush_hud_interactive = D.brush_hud_interactive,
-    })
+    -- After SWS/bounds update: flush uses a stable target_envelope for the whole LMB-down stroke.
+    if not State.debug_disable_js_eat then
+        run_pending_envelope_flush()
+    end
+
+    -- Eat arrange LMB/MOVE only on envelope lane (SWS hover) or while finishing a brush drag off the lane.
+    if not State.debug_disable_js_eat then
+        Core.process_arrange_lmb_or_forward(State, State.overlay_visible or State.is_dragging)
+    end
+
+    -- Schedule envelope work for the *next* defer tick (see run_pending_envelope_flush): same-tick-as-ImGui was unreliable.
+    local lmb_down = Core.is_lmb_down_js()
+    if not State.debug_disable_js_eat then
+        Core.sync_arrange_mouse_eat_with_os(State, lmb_down)
+        if lmb_down and State.target_envelope then
+            State.envelope_flush_pending = true
+        elseif not lmb_down and State.is_dragging then
+            D.end_drag_operation()
+        end
+    else
+        -- No deferred flush / intercepts: run insert + sculpt same frame (debug “no eat” mode).
+        if lmb_down and State.target_envelope then
+            if reaper.PreventUIRefresh then
+                reaper.PreventUIRefresh(1)
+            end
+            if not State.is_dragging then
+                Input.on_lmb_pressed(State, CONFIG, mouse_x, mouse_y, {
+                    seed_brush_width_at_client = D.seed_brush_width_at_client,
+                    capture_points_in_radius = D.capture_points_in_radius,
+                })
+            elseif State.drag_mode == "sculpt" then
+                Input.try_apply_sculpt_drag(State, CONFIG, mouse_x, mouse_y, {
+                    capture_points_in_radius = D.capture_points_in_radius,
+                    sculpt_captured_points = D.sculpt_captured_points,
+                    refresh_captured_from_envelope = D.refresh_captured_from_envelope,
+                })
+            elseif State.drag_mode == "combined" then
+                Input.try_combined_drag(State, CONFIG, mouse_x, mouse_y, {
+                    capture_points_in_radius = D.capture_points_in_radius,
+                    sculpt_captured_points = D.sculpt_captured_points,
+                    refresh_captured_from_envelope = D.refresh_captured_from_envelope,
+                })
+            end
+            if reaper.PreventUIRefresh then
+                reaper.PreventUIRefresh(-1)
+            end
+            reaper.UpdateArrange()
+        elseif not lmb_down and State.is_dragging then
+            D.end_drag_operation()
+        end
+    end
+
+    local open
+    if State.suppress_imgui_control_this_frame then
+        State.suppress_imgui_control_this_frame = false
+        open = true
+    else
+        open = UI.draw_control_window(State, CONFIG, {
+            get_mouse_client_xy = D.get_mouse_client_xy,
+            brush_hud_interactive = D.brush_hud_interactive,
+            debug_synthetic_insert_from_last_item = D.debug_synthetic_insert_from_last_item,
+        })
+    end
+
+    if State.debug_show_insert_panel then
+        UI.draw_insert_debug_panel(State, CONFIG)
+    end
+
+    if State.debug_disable_js_eat ~= State._debug_js_eat_prev then
+        State._debug_js_eat_prev = State.debug_disable_js_eat
+        if State.debug_disable_js_eat then
+            State.envelope_flush_pending = false
+            Core.release_arrange_intercepts(State)
+        else
+            Core.ensure_arrange_intercepts(State)
+        end
+    end
 
     Render.render_brush_hud(State, CONFIG, {
         calc_inner_brush_radius = D.calc_inner_brush_radius,
@@ -111,37 +234,6 @@ local function main_loop()
         clear_envelope_target = D.clear_envelope_target,
         falloff_types = CONFIG.FALLOFF_TYPES,
     })
-
-    local mx, my = D.get_mouse_client_xy()
-    if mx == nil or my == nil then
-        if open then
-            reaper.defer(main_loop)
-        else
-            on_script_close()
-        end
-        return
-    end
-    State.mouse_pos = { x = mx, y = my }
-
-    local lmb_down = Core.is_lmb_down_js()
-    if lmb_down and State.target_envelope then
-        if not State.is_dragging then
-            Input.on_lmb_pressed(State, CONFIG, mx, my, {
-                create_points_in_brush_area = D.create_points_in_brush_area,
-                capture_points_in_radius = D.capture_points_in_radius,
-            })
-        elseif State.drag_mode == "combined" then
-            Input.try_combined_drag(State, CONFIG, mx, my, {
-                get_distance = Core.get_distance,
-                create_points_in_brush_area = D.create_points_in_brush_area,
-                capture_points_in_radius = D.capture_points_in_radius,
-                sculpt_captured_points = D.sculpt_captured_points,
-                refresh_captured_from_envelope = D.refresh_captured_from_envelope,
-            })
-        end
-    elseif not lmb_down and State.is_dragging then
-        D.end_drag_operation()
-    end
 
     if open then
         reaper.defer(main_loop)

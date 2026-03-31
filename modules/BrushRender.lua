@@ -24,6 +24,10 @@ function M.render_brush_hud(state, config, deps)
     local ctx = state.ctx
     if not ctx then return end
 
+    if state.debug_disable_js_eat then
+        return
+    end
+
     if not M.brush_hud_interactive(state) then
         return
     end
