@@ -13,19 +13,26 @@ for k, v in pairs(EnvApi) do
 end
 
 function M.new_state(config)
+    local b, f, s = config.brush, config.falloff, config.sculpt
     return {
         -- Brush settings
-        brush_size = config.DEFAULT_BRUSH_SIZE,
+        brush_size = b.DEFAULT_BRUSH_SIZE,
+        invert_brush_size_scroll = b.DEFAULT_INVERT_BRUSH_SIZE_SCROLL,
         falloff_type = 1,
-        falloff_strength = config.DEFAULT_FALLOFF_STRENGTH,
+        falloff_strength = f.DEFAULT_FALLOFF_STRENGTH,
         --- Set on LMB down: "nudge" | "sculpt" | "smooth" (see BrushInput.resolve_brush_drag_kind).
         active_sculpt_kind = nil,
-        smooth_strength = config.DEFAULT_SMOOTH_STRENGTH,
-        sculpt_power = config.DEFAULT_SCULPT_POWER,
-        sculpt_seed_blend_to_cursor = config.DEFAULT_SCULPT_SEED_BLEND_TO_CURSOR,
-        min_point_spacing_px = config.DEFAULT_MIN_POINT_SPACING_PX,
+        sculpt_power = s.DEFAULT_SCULPT_POWER,
+        enable_continuous_smoothing = s.DEFAULT_ENABLE_CONTINUOUS_SMOOTHING,
+        min_point_spacing_px = config.spacing.DEFAULT_MIN_POINT_SPACING_PX,
         lock_time_axis = false,
         lock_value_axis = false,
+        --- RMB click (no drag) on lane: freeze brush HUD and show inline settings under the brush.
+        brush_settings_mode = false,
+        brush_settings_freeze_client = nil,
+        _rmb_down_prev = false,
+        _rmb_press_client = nil,
+        _rmb_dragged = false,
 
         -- Mouse and interaction
         mouse_pos = {x = 0, y = 0},
@@ -78,6 +85,7 @@ function M.new_state(config)
         -- Arrange: JS_WindowMessage_Intercept/Peek (wheel + LMB + optional MOVE while eating LMB).
         arrange_intercept_active = false,
         arrange_intercept_hwnd = nil,
+        brush_ate_arrange_rmb = false,
         wm_wheel_last_time = 0,
         wm_lmb_down_last_time = 0,
         wm_lmb_up_last_time = 0,
@@ -101,6 +109,8 @@ function M.new_state(config)
         brush_hud_text_alpha = 1.0,
         _brush_hud_fade_last_os = nil,
         _vk_tab_down_prev = false,
+        --- JS VK_ESCAPE edge tracking while brush settings mode is open (arrange has focus).
+        _brush_settings_esc_js_prev = false,
 
         -- Wheel inertial coast for plain scroll (brush size) only.
         wheel_momentum_vel = 0,
@@ -123,7 +133,7 @@ function M.tick_throttled_envelope_sort_if_due(state, config, ops)
         return false
     end
     local now = reaper.time_precise and reaper.time_precise() or 0
-    local iv = config.ENVELOPE_SORT_INTERVAL_SEC or 0.25
+    local iv = config.sculpt.ENVELOPE_SORT_INTERVAL_SEC or 0.25
     local last = state.last_envelope_sort_os
     if last ~= nil and (now - last) < iv then
         return false
@@ -138,11 +148,12 @@ function M.tick_throttled_envelope_sort_if_due(state, config, ops)
 end
 
 function M.calc_inner_brush_radius(state, config, outer_radius)
-    local span = config.MAX_FALLOFF_STRENGTH - config.MIN_FALLOFF_STRENGTH
-    local t = span > 1e-9 and (state.falloff_strength - config.MIN_FALLOFF_STRENGTH) / span or 0.5
+    local f = config.falloff
+    local span = f.MAX_FALLOFF_STRENGTH - f.MIN_FALLOFF_STRENGTH
+    local t = span > 1e-9 and (state.falloff_strength - f.MIN_FALLOFF_STRENGTH) / span or 0.5
     t = M.clamp(t, 0, 1)
-    local rmin = config.FALLOFF_INNER_RATIO_AT_MAX_STRENGTH
-    local rmax = config.FALLOFF_INNER_RATIO_AT_MIN_STRENGTH
+    local rmin = f.FALLOFF_INNER_RATIO_AT_MAX_STRENGTH
+    local rmax = f.FALLOFF_INNER_RATIO_AT_MIN_STRENGTH
     local ratio = rmax - t * (rmax - rmin)
     return outer_radius * ratio
 end
@@ -235,6 +246,12 @@ function M.is_lmb_down_js()
     return (st % 2) >= 1
 end
 
+--- Bitmask 2 = right button (js_ReaScript JS_Mouse_GetState).
+function M.is_rmb_down_js()
+    if not reaper.JS_Mouse_GetState then return false end
+    return ((reaper.JS_Mouse_GetState(2) or 0) > 0)
+end
+
 function M.ensure_arrange_intercepts(state)
     return ArrangeMsg.ensure_arrange_intercepts(state, M.get_arrange_hwnd)
 end
@@ -243,12 +260,12 @@ function M.release_arrange_intercepts(state)
     return ArrangeMsg.release_arrange_intercepts(state)
 end
 
-function M.process_arrange_lmb_or_forward(state, eat_lmb)
-    return ArrangeMsg.process_arrange_lmb_or_forward(state, eat_lmb, M.get_arrange_hwnd)
+function M.process_arrange_lmb_or_forward(state, eat_lmb, eat_rmb)
+    return ArrangeMsg.process_arrange_lmb_or_forward(state, eat_lmb, M.get_arrange_hwnd, eat_rmb)
 end
 
-function M.sync_arrange_mouse_eat_with_os(state, lmb_down)
-    return ArrangeMsg.sync_arrange_mouse_eat_with_os(state, lmb_down)
+function M.sync_arrange_mouse_eat_with_os(state, lmb_down, rmb_down)
+    return ArrangeMsg.sync_arrange_mouse_eat_with_os(state, lmb_down, rmb_down)
 end
 
 function M.take_arrange_wheel_or_forward(state, brush_eat)
@@ -273,8 +290,29 @@ function M.calculate_falloff(distance, radius, falloff_type_name, strength)
     elseif falloff_type_name == "linear" then
         -- Cap center weight at 1; strength still steepens the falloff toward the edge (cf. exponential modes).
         return math.min(1, (1 - normalized) * strength)
-    else -- inverse_exponential
+    elseif falloff_type_name == "inverse_exponential" then
         return (1 - math.exp(-strength * 3 * (1 - normalized)))
+    elseif falloff_type_name == "smoothstep" then
+        -- 3u² − 2u³ on (1 − t): flat center / flat edge, steep mid transition; strength scales like linear.
+        local u = 1 - normalized
+        if u <= 0 then return 0 end
+        if u >= 1 then u = 1 end
+        local w = u * u * (3 - 2 * u)
+        return math.min(1, w * strength)
+    elseif falloff_type_name == "circle" then
+        -- Hemisphere √(1 − t²): spherical cap; zero slope at center (smooth top).
+        local inner = 1 - normalized * normalized
+        if inner <= 0 then return 0 end
+        local w = math.sqrt(inner)
+        return math.min(1, w * strength)
+    elseif falloff_type_name == "gaussian" then
+        -- Quadratic in distance: tighter bell than exponential at same strength.
+        return math.exp(-strength * 4 * normalized * normalized)
+    elseif falloff_type_name == "cosine" then
+        -- Half raised cosine: smooth Hann-like edge, no cusp at brush rim.
+        return math.min(1, 0.5 * (1 + math.cos(math.pi * normalized)) * strength)
+    else
+        return math.exp(-strength * 3 * normalized)
     end
 end
 

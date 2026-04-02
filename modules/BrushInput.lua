@@ -16,6 +16,7 @@ local MK_SHIFT = 0x0004
 local MK_CONTROL = 0x0008
 local JS_SHIFT = 8
 local VK_MENU = 0x12 -- Alt / Option: use with JS_Mouse_GetState for wheel falloff only
+local VK_ESCAPE = 0x1B
 
 local function js_mod_down(bit)
     if not reaper.JS_Mouse_GetState then return false end
@@ -167,8 +168,9 @@ function M.tick_wheel_momentum(state, config, clamp)
         M.clear_wheel_momentum(state)
         return
     end
+    local wcfg, bcfg = config.wheel, config.brush
     local v = state.wheel_momentum_vel or 0
-    if math.abs(v) < (config.WHEEL_MOMENTUM_STOP or 0.03) then
+    if math.abs(v) < (wcfg.WHEEL_MOMENTUM_STOP or 0.03) then
         M.clear_wheel_momentum(state)
         return
     end
@@ -179,40 +181,40 @@ function M.tick_wheel_momentum(state, config, clamp)
         return
     end
 
-    local maxv = config.WHEEL_MOMENTUM_MAX_VEL or 32
+    local maxv = wcfg.WHEEL_MOMENTUM_MAX_VEL or 32
     v = math.max(-maxv, math.min(maxv, v))
-    v = v * (config.WHEEL_MOMENTUM_FRICTION or 0.87)
+    v = v * (wcfg.WHEEL_MOMENTUM_FRICTION or 0.87)
 
     local bs = state.brush_size
-    if bs >= config.MAX_BRUSH_SIZE and v > 0 then
+    if bs >= bcfg.MAX_BRUSH_SIZE and v > 0 then
         v = 0
         state.wheel_mom_size_accum = 0
-    elseif bs <= config.MIN_BRUSH_SIZE and v < 0 then
+    elseif bs <= bcfg.MIN_BRUSH_SIZE and v < 0 then
         v = 0
         state.wheel_mom_size_accum = 0
     else
-        local rate = config.WHEEL_MOMENTUM_SIZE_RATE or 0.13
+        local rate = wcfg.WHEEL_MOMENTUM_SIZE_RATE or 0.13
         state.wheel_mom_size_accum = (state.wheel_mom_size_accum or 0) + v * rate
         local acc = state.wheel_mom_size_accum
-        local step_px = math.max(1, math.floor(config.BRUSH_SIZE_STEP + 0.5))
+        local step_px = math.max(1, math.floor(bcfg.BRUSH_SIZE_STEP + 0.5))
         while acc >= 1 do
-            state.brush_size = clamp(state.brush_size + step_px, config.MIN_BRUSH_SIZE, config.MAX_BRUSH_SIZE)
+            state.brush_size = clamp(state.brush_size + step_px, bcfg.MIN_BRUSH_SIZE, bcfg.MAX_BRUSH_SIZE)
             acc = acc - 1
         end
         while acc <= -1 do
-            state.brush_size = clamp(state.brush_size - step_px, config.MIN_BRUSH_SIZE, config.MAX_BRUSH_SIZE)
+            state.brush_size = clamp(state.brush_size - step_px, bcfg.MIN_BRUSH_SIZE, bcfg.MAX_BRUSH_SIZE)
             acc = acc + 1
         end
         state.wheel_mom_size_accum = acc
     end
 
     state.wheel_momentum_vel = v
-    if math.abs(v) < (config.WHEEL_MOMENTUM_STOP or 0.03) then
+    if math.abs(v) < (wcfg.WHEEL_MOMENTUM_STOP or 0.03) then
         M.clear_wheel_momentum(state)
     end
 end
 
---- Scroll: brush size | Alt+scroll: falloff | Cmd/Ctrl+scroll: sculpt power (Alt wins if both) | Shift: finer steps.
+--- Scroll: brush size | Alt+scroll: falloff | Cmd/Ctrl+scroll: power (Alt wins if both) | Shift: 25% finer steps.
 --- Arrange wheel: intercepted (blocked); eaten for brush when context active, else forwarded to arrange.
 function M.handle_wheel_input(state, config, clamp, core)
     if not state.ctx then return false end
@@ -228,38 +230,86 @@ function M.handle_wheel_input(state, config, clamp, core)
     if wheel_delta == 0 then return false end
 
     local alt = wheel_mod_alt()
-    local fine = wheel_mod_shift(arrange_wparam_lo) and 0.5 or 1.0
+    local fine = wheel_mod_shift(arrange_wparam_lo) and 0.25 or 1.0
     local d = wheel_delta > 0 and 1 or -1
+    --- Default scroll→size mapping is inverted vs raw wheel delta; optional checkbox restores the legacy direction.
+    local d_size = state.invert_brush_size_scroll and d or -d
 
+    local fcfg, scfg, bcfg, wcfg = config.falloff, config.sculpt, config.brush, config.wheel
     if alt then
         M.clear_wheel_momentum(state)
-        local step = config.FALLOFF_STRENGTH_STEP * fine
+        local step = fcfg.FALLOFF_STRENGTH_STEP * fine
         state.falloff_strength = clamp(state.falloff_strength + d * step,
-            config.MIN_FALLOFF_STRENGTH, config.MAX_FALLOFF_STRENGTH)
+            fcfg.MIN_FALLOFF_STRENGTH, fcfg.MAX_FALLOFF_STRENGTH)
     elseif wheel_mod_power_cmd_ctrl(arrange_wparam_lo) then
         M.clear_wheel_momentum(state)
-        local step = config.SCULPT_POWER_STEP * fine
+        local step = scfg.SCULPT_POWER_STEP * fine
         state.sculpt_power = clamp(state.sculpt_power + d * step,
-            config.MIN_SCULPT_POWER, config.MAX_SCULPT_POWER)
+            scfg.MIN_SCULPT_POWER, scfg.MAX_SCULPT_POWER)
     else
-        local step = math.max(1, math.floor(config.BRUSH_SIZE_STEP * fine + 0.5))
-        state.brush_size = clamp(state.brush_size + d * step,
-            config.MIN_BRUSH_SIZE, config.MAX_BRUSH_SIZE)
-        local imp = config.WHEEL_MOMENTUM_IMPULSE or 2.5
+        local step = math.max(1, math.floor(bcfg.BRUSH_SIZE_STEP * fine + 0.5))
+        state.brush_size = clamp(state.brush_size + d_size * step,
+            bcfg.MIN_BRUSH_SIZE, bcfg.MAX_BRUSH_SIZE)
+        local imp = wcfg.WHEEL_MOMENTUM_IMPULSE or 2.5
         local mag = math.min(math.abs(wheel_delta), 4)
         local sign = wheel_delta > 0 and 1 or -1
-        local add = sign * mag * imp * fine
-        state.wheel_momentum_vel = math.max(-(config.WHEEL_MOMENTUM_MAX_VEL or 32),
-            math.min(config.WHEEL_MOMENTUM_MAX_VEL or 32, (state.wheel_momentum_vel or 0) + add))
+        local mul = state.invert_brush_size_scroll and 1 or -1
+        local add = sign * mag * imp * fine * mul
+        state.wheel_momentum_vel = math.max(-(wcfg.WHEEL_MOMENTUM_MAX_VEL or 32),
+            math.min(wcfg.WHEEL_MOMENTUM_MAX_VEL or 32, (state.wheel_momentum_vel or 0) + add))
     end
 
     return true
 end
 
+--- True once on physical Esc down while settings open (ImGui may not see key over arrange).
+local function js_escape_pressed_edge(state)
+    if not reaper.JS_VKeys_GetState then return false end
+    local down = (reaper.JS_VKeys_GetState(VK_ESCAPE) or 0) ~= 0
+    if not state.brush_settings_mode then
+        state._brush_settings_esc_js_prev = down
+        return false
+    end
+    local pressed = down and not state._brush_settings_esc_js_prev
+    state._brush_settings_esc_js_prev = down
+    return pressed
+end
+
+--- LMB on non-widget (arrange, void, other windows) exits brush settings mode.
+function M.tick_brush_settings_lmb_dismiss(state)
+    if not state.brush_settings_mode or not state.ctx then
+        return
+    end
+    if not reaper.ImGui_IsMouseClicked or not reaper.ImGui_IsAnyItemHovered then
+        return
+    end
+    local ctx = state.ctx
+    local btn = 0
+    if reaper.ImGui_MouseButton_Left then
+        local ml = reaper.ImGui_MouseButton_Left
+        btn = type(ml) == "function" and ml() or ml
+    end
+    if not reaper.ImGui_IsMouseClicked(ctx, btn) then
+        return
+    end
+    if reaper.ImGui_IsAnyItemHovered(ctx) then
+        return
+    end
+    state.brush_settings_mode = false
+    state.brush_settings_freeze_client = nil
+end
+
 function M.handle_keyboard_input(state, deps)
     if not state.ctx then return false end
 
-    if imgui_key_pressed_any(state, reaper.ImGui_Key_Escape()) then
+    local esc_imgui = imgui_key_pressed_any(state, reaper.ImGui_Key_Escape())
+    if state.brush_settings_mode and (js_escape_pressed_edge(state) or esc_imgui) then
+        state.brush_settings_mode = false
+        state.brush_settings_freeze_client = nil
+        return true
+    end
+
+    if esc_imgui then
         if deps.request_script_close then
             deps.request_script_close()
         end
@@ -267,6 +317,43 @@ function M.handle_keyboard_input(state, deps)
     end
 
     return false
+end
+
+local RMB_DRAG_THRESH_PX = 8
+
+--- RMB up without drag on brush lane: toggle frozen HUD settings mode (see BrushRender.render_brush_hud_panel).
+function M.tick_rmb_brush_settings(state, brush_context_ok, mouse_x, mouse_y)
+    if not reaper.JS_Mouse_GetState then return end
+    local rmb_down = (reaper.JS_Mouse_GetState(2) or 0) > 0
+    if rmb_down and not state._rmb_down_prev then
+        state._rmb_press_client = (mouse_x and mouse_y) and { x = mouse_x, y = mouse_y } or nil
+        state._rmb_dragged = false
+    end
+    if rmb_down and state._rmb_press_client and mouse_x and mouse_y then
+        local dx = mouse_x - state._rmb_press_client.x
+        local dy = mouse_y - state._rmb_press_client.y
+        if (dx * dx + dy * dy) > (RMB_DRAG_THRESH_PX * RMB_DRAG_THRESH_PX) then
+            state._rmb_dragged = true
+        end
+    end
+    if not rmb_down and state._rmb_down_prev then
+        if state._rmb_press_client and not state._rmb_dragged and brush_context_ok then
+            if state.brush_settings_mode then
+                state.brush_settings_mode = false
+                state.brush_settings_freeze_client = nil
+            else
+                state.brush_settings_mode = true
+                state.brush_settings_freeze_client = { x = state._rmb_press_client.x, y = state._rmb_press_client.y }
+                if reaper.JS_VKeys_GetState then
+                    state._brush_settings_esc_js_prev = (reaper.JS_VKeys_GetState(VK_ESCAPE) or 0) ~= 0
+                else
+                    state._brush_settings_esc_js_prev = false
+                end
+            end
+        end
+        state._rmb_press_client = nil
+    end
+    state._rmb_down_prev = rmb_down
 end
 
 --- Tab: JS_VKeys (global), gated to brush_wheel_context_active — works over arrange without ImGui focus.
@@ -288,15 +375,18 @@ function M.handle_tab_cycle_falloff(state, deps)
 end
 
 local function sculpt_delta_below_threshold(dx, dy, config)
-    local t = config.SCULPT_DRAG_MIN_MOVEMENT_PX or 0.02
+    local t = config.sculpt.SCULPT_DRAG_MIN_MOVEMENT_PX or 0.02
     return (dx * dx + dy * dy) < (t * t)
 end
 
 function M.try_apply_sculpt_drag(state, config, mx, my, deps)
     if not state.target_envelope or state.drag_mode ~= "sculpt" then return end
 
-    -- Capture is fixed at LMB (on_lmb_pressed); do not re-scan each frame or the brush "picks up" new points.
-    if #state.captured_points == 0 then
+    local kind = state.active_sculpt_kind or "nudge"
+    local continuous_smooth = kind == "smooth" and state.enable_continuous_smoothing
+
+    -- Fixed capture at LMB: nothing to sculpt — keep last_client in sync with the pointer.
+    if #state.captured_points == 0 and not continuous_smooth then
         state.sculpt_last_client = { x = mx, y = my }
         return
     end
@@ -311,7 +401,14 @@ function M.try_apply_sculpt_drag(state, config, mx, my, deps)
         return
     end
 
-    local kind = state.active_sculpt_kind or "nudge"
+    if continuous_smooth then
+        state.captured_points = deps.capture_points_in_radius(mx, my, state.brush_size, state.target_envelope)
+    end
+
+    if #state.captured_points == 0 then
+        state.sculpt_last_client = { x = mx, y = my }
+        return
+    end
     local undo_name = (kind == "smooth") and "Brush Smooth Envelope" or "Brush Nudge Envelope"
     begin_undo_once(state, undo_name)
     deps.sculpt_captured_points(state.captured_points, dx, dy, state.target_envelope)
@@ -362,6 +459,7 @@ function M.on_lmb_pressed(state, config, mx, my, deps)
     end
 
     local n = deps.seed_brush_width_at_client(mx, my)
+
     if n > 0 then
         reaper.Undo_BeginBlock()
         state.undo_active = true

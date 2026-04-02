@@ -56,7 +56,7 @@ function M.ensure_arrange_intercepts(state, get_arrange_hwnd)
     if not reaper.JS_WindowMessage_Intercept or not reaper.JS_WindowMessage_Peek then return false end
     local hwnd = get_arrange_hwnd and get_arrange_hwnd() or nil
     if not hwnd then return false end
-    local msgs = { "WM_MOUSEWHEEL", "WM_LBUTTONDOWN", "WM_LBUTTONUP" }
+    local msgs = { "WM_MOUSEWHEEL", "WM_LBUTTONDOWN", "WM_LBUTTONUP", "WM_RBUTTONDOWN", "WM_RBUTTONUP" }
     for i = 1, #msgs do
         if not pcall(reaper.JS_WindowMessage_Intercept, hwnd, msgs[i], false) then
             for j = 1, i - 1 do
@@ -79,17 +79,24 @@ function M.release_arrange_intercepts(state)
     state.wm_wheel_last_time = 0
     state.wm_lmb_down_last_time = 0
     state.wm_lmb_up_last_time = 0
+    state.wm_rmb_down_last_time = 0
+    state.wm_rmb_up_last_time = 0
     state.wm_mousemove_last_time = 0
     state.brush_ate_arrange_lmb = false
+    state.brush_ate_arrange_rmb = false
     if hwnd then
         release_one_message(hwnd, "WM_MOUSEWHEEL")
         release_one_message(hwnd, "WM_LBUTTONDOWN")
         release_one_message(hwnd, "WM_LBUTTONUP")
+        release_one_message(hwnd, "WM_RBUTTONDOWN")
+        release_one_message(hwnd, "WM_RBUTTONUP")
     end
 end
 
---- Peek WM_LBUTTON* / WM_MOUSEMOVE: eat when brushing (target envelope), else forward. MOVE intercepted only after an eaten down.
-function M.process_arrange_lmb_or_forward(state, eat_lmb, get_arrange_hwnd)
+--- Peek WM_LBUTTON* / WM_MOUSEMOVE / WM_RBUTTON*: eat when brushing (target envelope), else forward. MOVE intercepted only after an eaten down.
+--- eat_rmb: when nil, defaults to eat_lmb (backward compatible).
+function M.process_arrange_lmb_or_forward(state, eat_lmb, get_arrange_hwnd, eat_rmb)
+    eat_rmb = (eat_rmb ~= nil) and eat_rmb or eat_lmb
     if not state.arrange_intercept_active or not reaper.JS_WindowMessage_Peek then return end
     local hwnd = state.arrange_intercept_hwnd or (get_arrange_hwnd and get_arrange_hwnd()) or nil
     if not hwnd then return end
@@ -121,6 +128,31 @@ function M.process_arrange_lmb_or_forward(state, eat_lmb, get_arrange_hwnd)
     handle_lmb("WM_LBUTTONDOWN", "wm_lmb_down_last_time")
     handle_lmb("WM_LBUTTONUP", "wm_lmb_up_last_time")
 
+    local function handle_rmb(msg, last_key)
+        local ret, _, time, wpl, wph, lpl, lph = reaper.JS_WindowMessage_Peek(hwnd, msg)
+        if not ret or not time or time == 0 then return end
+        if time == state[last_key] then return end
+        state[last_key] = time
+
+        if msg == "WM_RBUTTONDOWN" then
+            if eat_rmb then
+                state.brush_ate_arrange_rmb = true
+            else
+                state.brush_ate_arrange_rmb = false
+                forward_wm(hwnd, msg, wpl, wph, lpl, lph)
+            end
+        else
+            if state.brush_ate_arrange_rmb then
+                state.brush_ate_arrange_rmb = false
+            else
+                forward_wm(hwnd, msg, wpl, wph, lpl, lph)
+            end
+        end
+    end
+
+    handle_rmb("WM_RBUTTONDOWN", "wm_rmb_down_last_time")
+    handle_rmb("WM_RBUTTONUP", "wm_rmb_up_last_time")
+
     if state.arrange_move_intercept_active then
         while true do
             local ret, _, time = reaper.JS_WindowMessage_Peek(hwnd, "WM_MOUSEMOVE")
@@ -132,11 +164,16 @@ function M.process_arrange_lmb_or_forward(state, eat_lmb, get_arrange_hwnd)
 end
 
 --- If OS says LMB is up but we still hold eat/MOVE intercept (e.g. release outside arrange), clear it.
-function M.sync_arrange_mouse_eat_with_os(state, lmb_down)
-    if lmb_down then return end
-    if state.brush_ate_arrange_lmb or state.arrange_move_intercept_active then
-        state.brush_ate_arrange_lmb = false
-        release_arrange_move_intercept(state)
+--- If OS says RMB is up but we still hold RMB eat, clear it.
+function M.sync_arrange_mouse_eat_with_os(state, lmb_down, rmb_down)
+    if not lmb_down then
+        if state.brush_ate_arrange_lmb or state.arrange_move_intercept_active then
+            state.brush_ate_arrange_lmb = false
+            release_arrange_move_intercept(state)
+        end
+    end
+    if rmb_down == false and state.brush_ate_arrange_rmb then
+        state.brush_ate_arrange_rmb = false
     end
 end
 

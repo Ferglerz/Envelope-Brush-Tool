@@ -94,7 +94,10 @@ end
 --- Deletes higher original indices first. Optionally updates `captured_points` when points are removed.
 function M.enforce_min_screen_spacing(state, envelope, autoitem_idx, envelope_to_screen, get_distance, captured_points)
     local thresh = state and state.min_point_spacing_px
-    if not envelope or not envelope_to_screen or not get_distance or thresh == nil or thresh <= 0 then
+    if thresh ~= nil then
+        thresh = math.max(1, thresh)
+    end
+    if not envelope or not envelope_to_screen or not get_distance or thresh == nil then
         return 0
     end
 
@@ -165,12 +168,22 @@ function M.min_screen_dist_to_envelope_points(envelope, autoitem_idx, sx, sy, en
     return best
 end
 
+--- Same insert time in one seed pass (quantized grid + rim) → duplicate envelope times → vertical spikes.
+local function insert_t_already_placed(list, insert_t, eps_t)
+    for i = 1, #list do
+        if math.abs(list[i] - insert_t) <= eps_t then
+            return true
+        end
+    end
+    return false
+end
+
 function M.capture_points_in_radius(state, config, mouse_x, mouse_y, radius, envelope, autoitem_idx, envelope_to_screen, get_distance, calculate_falloff)
     if not envelope then return {} end
 
     local captured = {}
     local point_count = count_envelope_points(envelope, autoitem_idx)
-    local falloff_name = config.FALLOFF_TYPES[state.falloff_type]
+    local falloff_name = config.falloff.FALLOFF_TYPES[state.falloff_type]
 
     for i = 0, point_count - 1 do
         local retval, time, value, shape, tension, selected = get_envelope_point(envelope, autoitem_idx, i)
@@ -264,11 +277,11 @@ function M.sculpt_captured_points(state, config, captured_points, delta_x, delta
     local d_span = d_hi - d_lo
 
     local kind = state.active_sculpt_kind or "nudge"
-    -- Smooth uses Shift as mode key (no Fine halving here). Sculpt + Shift: Fine (half strength).
+    -- Smooth uses Shift as mode key (no Fine scaling here). Sculpt + Shift: Fine (25% strength).
     local strength_scale = 1.0
     if kind ~= "smooth" and reaper.JS_Mouse_GetState then
         if (reaper.JS_Mouse_GetState(JS_SHIFT) or 0) > 0 then
-            strength_scale = 0.5
+            strength_scale = 0.25
         end
     end
     local power = (state.sculpt_power or 1.0) * strength_scale
@@ -289,15 +302,12 @@ function M.sculpt_captured_points(state, config, captured_points, delta_x, delta
     local tent_t = {}
     local tent_v = {}
 
-    local smooth_mean_d
+    --- Shift smooth: time targets from even spacing across brush width; value = Laplacian on full envelope (time order).
     local smooth_t_target_by_index
+    local smooth_env_sorted -- { { idx, time, val }, ... } sorted by time
+    local smooth_env_pos_by_idx -- envelope point index -> 1-based rank in smooth_env_sorted
     if kind == "smooth" and #captured_points > 0 then
         local ncap = #captured_points
-        local sumd = 0
-        for _, pi in ipairs(captured_points) do
-            sumd = sumd + EnvScale.raw_to_display(scale_mode, pi.original_value)
-        end
-        smooth_mean_d = sumd / ncap
         local sorted = {}
         for _, pi in ipairs(captured_points) do
             sorted[#sorted + 1] = { pi = pi, t = pi.original_time }
@@ -325,6 +335,28 @@ function M.sculpt_captured_points(state, config, captured_points, delta_x, delta
             end
             smooth_t_target_by_index[row.pi.index] = tt
         end
+
+        if not state.lock_value_axis and point_count >= 2 then
+            smooth_env_sorted = {}
+            for i = 0, point_count - 1 do
+                local ok, t, v = get_envelope_point(envelope, autoitem_idx, i)
+                if ok and t ~= nil and v ~= nil then
+                    smooth_env_sorted[#smooth_env_sorted + 1] = { idx = i, time = t, val = v }
+                end
+            end
+            table.sort(smooth_env_sorted, function(a, b)
+                if a.time ~= b.time then return a.time < b.time end
+                return a.idx < b.idx
+            end)
+            if #smooth_env_sorted >= 2 then
+                smooth_env_pos_by_idx = {}
+                for k, row in ipairs(smooth_env_sorted) do
+                    smooth_env_pos_by_idx[row.idx] = k
+                end
+            else
+                smooth_env_sorted = nil
+            end
+        end
     end
 
     for _, point_info in ipairs(captured_points) do
@@ -334,13 +366,31 @@ function M.sculpt_captured_points(state, config, captured_points, delta_x, delta
         local new_value = point_info.original_value
 
         if kind == "smooth" then
-            local base = config.SMOOTH_SETTLE_BASE_PER_MOVE * clamp(state.smooth_strength,
-                config.MIN_SMOOTH_STRENGTH, config.MAX_SMOOTH_STRENGTH)
+            local scfg = config.sculpt
+            local pw = clamp(state.sculpt_power or 1, scfg.MIN_SCULPT_POWER, scfg.MAX_SCULPT_POWER)
+            local base = scfg.SMOOTH_SETTLE_BASE_PER_MOVE * (pw / scfg.MAX_SCULPT_POWER)
             local alpha = base * f
-            if not state.lock_value_axis and smooth_mean_d ~= nil then
-                local d_i = EnvScale.raw_to_display(scale_mode, point_info.original_value)
-                local d_new = d_i + (smooth_mean_d - d_i) * alpha
-                new_value = clamp(EnvScale.display_to_raw(scale_mode, d_new), min_val, max_val)
+            -- Laplacian in display space: interior → blend toward mean of time-adjacent envelope neighbors; endpoints → toward sole neighbor.
+            if not state.lock_value_axis and smooth_env_sorted and smooth_env_pos_by_idx then
+                local pos = smooth_env_pos_by_idx[point_info.index]
+                if pos then
+                    local rows = smooth_env_sorted
+                    local d_i = EnvScale.raw_to_display(scale_mode, point_info.original_value)
+                    local d_prev = pos > 1 and EnvScale.raw_to_display(scale_mode, rows[pos - 1].val) or nil
+                    local d_next = pos < #rows and EnvScale.raw_to_display(scale_mode, rows[pos + 1].val) or nil
+                    local d_target
+                    if d_prev and d_next then
+                        d_target = (d_prev + d_next) * 0.5
+                    elseif d_next then
+                        d_target = d_next
+                    elseif d_prev then
+                        d_target = d_prev
+                    else
+                        d_target = d_i
+                    end
+                    local d_new = d_i + (d_target - d_i) * alpha
+                    new_value = clamp(EnvScale.display_to_raw(scale_mode, d_new), min_val, max_val)
+                end
             end
             if not state.lock_time_axis and smooth_t_target_by_index then
                 local t_tgt = smooth_t_target_by_index[point_info.index]
@@ -423,7 +473,7 @@ function M.sculpt_captured_points(state, config, captured_points, delta_x, delta
     return points_moved
 end
 
-function M.create_points_in_brush_area(state, config, mouse_x, mouse_y, radius, envelope, autoitem_idx, screen_to_envelope, envelope_to_screen, get_distance, calculate_falloff, get_envelope_properties, value_for_insert, default_point_shape)
+function M.create_points_in_brush_area(state, config, mouse_x, mouse_y, radius, envelope, autoitem_idx, screen_to_envelope, envelope_to_screen, get_distance, get_envelope_properties, value_for_insert, default_point_shape)
     if not envelope or not value_for_insert or not get_envelope_properties then return 0 end
 
     local my_lane = EnvApi.clamp_client_y_to_value_axis(state, envelope, mouse_y)
@@ -438,58 +488,21 @@ function M.create_points_in_brush_area(state, config, mouse_x, mouse_y, radius, 
     local time_range = arrange_end - arrange_start
     local bounds = state.envelope_bounds
     local pixel_width = bounds.right - bounds.left
-    local v_top, v_bottom = EnvApi.envelope_value_axis_screen_for_mapping(state, envelope)
-    local pixel_height = v_bottom - v_top
-    if pixel_width <= 0 or pixel_height <= 0 then return 0 end
-
-    local scale_mode = EnvScale.scaling_mode(envelope)
-    local seed_blend = state.sculpt_seed_blend_to_cursor
-    local d_center_blend
-    if seed_blend then
-        local v_center, _, _ = value_for_insert(envelope, center_time, autoitem_idx)
-        if v_center == nil then return 0 end
-        local _, sy_curve = envelope_to_screen(center_time, v_center, envelope)
-        if not sy_curve then return 0 end
-        local d_lo = EnvScale.raw_to_display(scale_mode, min_val)
-        local d_hi = EnvScale.raw_to_display(scale_mode, max_val)
-        local d_span = d_hi - d_lo
-        local d_curve = EnvScale.raw_to_display(scale_mode, v_center)
-        d_center_blend = d_curve
-        if math.abs(d_span) >= 1e-12 then
-            d_center_blend = d_curve - ((my_lane - sy_curve) / pixel_height) * d_span
-        end
-    end
+    if pixel_width <= 0 then return 0 end
 
     local shape_in = (type(default_point_shape) == "number" and default_point_shape) or 0
 
     local radius_time = (radius / pixel_width) * time_range
-    local falloff_name = config.FALLOFF_TYPES[state.falloff_type]
-    local min_space = (state.min_point_spacing_px ~= nil and state.min_point_spacing_px > 0) and state.min_point_spacing_px or 0
     local points_created = 0
+    local eps_ins = math.max(1e-12, math.abs(time_range) * 1e-14)
+    --- Insert times committed this pass (avoids duplicate REAPER insert times in one seed pass).
+    local placed_insert_t = {}
 
-    local span_t = 2 * math.abs(radius_time)
-    if span_t < 1e-18 then
-        return 0
-    end
-
-    -- Sample timeline across brush diameter; spacing derived from min pixel gap (screen X ~ proportional to time).
+    local min_space = math.max(1, state.min_point_spacing_px or 1)
     local abs_tr = math.abs(time_range)
-    local step_target = abs_tr > 1e-18 and (min_space * 0.45 / pixel_width) * abs_tr or span_t
-    if step_target < 1e-24 or step_target ~= step_target then
-        step_target = span_t
-    end
-    if step_target > span_t then
-        step_target = span_t
-    end
+    local span_t = 2 * math.abs(radius_time)
 
-    local n = math.max(1, math.ceil(span_t / step_target))
-    if n > 256 then
-        n = 256
-    end
-    local actual_step = span_t / n
-    local t0 = center_time - math.abs(radius_time)
-
-    -- Min-distance list: only points in a time window around the brush (plus min-spacing slack in time). Full O(n) scan not needed.
+    -- Min-distance list: only points in a time window around the brush (plus min-spacing slack in time).
     local pad_t = math.abs(radius_time)
     if min_space > 0 and abs_tr > 1e-18 and pixel_width > 0 then
         pad_t = pad_t + (min_space / pixel_width) * abs_tr
@@ -519,33 +532,50 @@ function M.create_points_in_brush_area(state, config, mouse_x, mouse_y, radius, 
         return best
     end
 
+    if span_t < 1e-18 then
+        if points_created > 0 then
+            sort_envelope_points(envelope, autoitem_idx)
+            M.enforce_min_screen_spacing(state, envelope, autoitem_idx, envelope_to_screen, get_distance, nil)
+            reaper.UpdateArrange()
+        end
+        return points_created
+    end
+
+    -- Sample timeline across brush diameter; spacing derived from min pixel gap (screen X ~ proportional to time).
+    local step_target = abs_tr > 1e-18 and (min_space * 0.45 / pixel_width) * abs_tr or span_t
+    if step_target < 1e-24 or step_target ~= step_target then
+        step_target = span_t
+    end
+    if step_target > span_t then
+        step_target = span_t
+    end
+
+    local n = math.max(1, math.ceil(span_t / step_target))
+    if n > 256 then
+        n = 256
+    end
+    local actual_step = span_t / n
+    local t0 = center_time - math.abs(radius_time)
+
     for k = 0, n do
         local point_time = t0 + k * actual_step
         local time_distance = math.abs(point_time - center_time)
         local normalized_distance = math.abs(radius_time) > 1e-12 and (time_distance / math.abs(radius_time)) or 0
 
         if normalized_distance <= 1.0 + 1e-9 then
-            local base_value, insert_t = value_for_insert(envelope, point_time, autoitem_idx)
-            if base_value ~= nil and insert_t ~= nil then
-                local sx_c, sy_c = envelope_to_screen(point_time, base_value, envelope)
+            local base_value, insert_t, eval_t = value_for_insert(envelope, point_time, autoitem_idx)
+            if base_value ~= nil and insert_t ~= nil and not insert_t_already_placed(placed_insert_t, insert_t, eps_ins) then
+                local t_vis = eval_t or point_time
+                local sx_c, sy_c = envelope_to_screen(t_vis, base_value, envelope)
                 if sx_c and sy_c then
-                    local new_value
-                    if seed_blend then
-                        local d_screen = get_distance(mouse_x, my_lane, sx_c, sy_c)
-                        local w = calculate_falloff(d_screen, radius, falloff_name, state.falloff_strength)
-                        local d_base = EnvScale.raw_to_display(scale_mode, base_value)
-                        local d_new = d_base + (d_center_blend - d_base) * w
-                        new_value = EnvScale.display_to_raw(scale_mode, d_new)
-                        new_value = math.max(min_val, math.min(max_val, new_value))
-                    else
-                        new_value = math.max(min_val, math.min(max_val, base_value))
-                    end
-                    local sx, sy = envelope_to_screen(point_time, new_value, envelope)
+                    local new_value = math.max(min_val, math.min(max_val, base_value))
+                    local sx, sy = envelope_to_screen(t_vis, new_value, envelope)
                     if sx and sy then
                         if min_space <= 0 or min_dist_to_point_list(sx, sy) >= min_space then
                             local tension, selected, noSortIn = 0, false, true
                             if insert_envelope_point(envelope, autoitem_idx, insert_t, new_value, shape_in, tension, selected, noSortIn) then
                                 points_created = points_created + 1
+                                placed_insert_t[#placed_insert_t + 1] = insert_t
                                 screen_pt_list[#screen_pt_list + 1] = { sx, sy }
                             end
                         end
