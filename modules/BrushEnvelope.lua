@@ -1,12 +1,10 @@
 local M = {}
 local EPSILON = 1e-12
 
-local function get_bounds_metrics(bounds)
-    local pix_w = bounds.right - bounds.left
-    local pix_h = bounds.bottom - bounds.top
-    local center_y = (bounds.top + bounds.bottom) * 0.5
-    return pix_w, pix_h, center_y
-end
+local SCRIPT_PATH = debug.getinfo(1, "S").source:match("^@(.+)$") or ""
+local SCRIPT_DIR = SCRIPT_PATH:match("^(.*[\\/])") or ""
+local EnvScale = dofile(SCRIPT_DIR .. "BrushEnvelopeScale.lua")
+local EnvApi = dofile(SCRIPT_DIR .. "BrushEnvelopeApi.lua")
 
 function M.screen_to_envelope(state, get_envelope_properties, screen_x, screen_y, envelope)
     if not envelope then return nil, nil end
@@ -15,7 +13,9 @@ function M.screen_to_envelope(state, get_envelope_properties, screen_x, screen_y
     local arrange_end = state.frame_arrange_end
     local bounds = state.envelope_bounds
 
-    local pix_w, pix_h = get_bounds_metrics(bounds)
+    local pix_w = bounds.right - bounds.left
+    local v_top, v_bottom = EnvApi.envelope_value_axis_screen_for_mapping(state, envelope)
+    local pix_h = v_bottom - v_top
     if pix_w <= 0 or pix_h <= 0 then return nil, nil end
 
     local time_ratio = (screen_x - bounds.left) / pix_w
@@ -24,13 +24,18 @@ function M.screen_to_envelope(state, get_envelope_properties, screen_x, screen_y
     local min_val, max_val = get_envelope_properties(envelope)
     if not min_val then return nil, nil end
 
-    local v_span = max_val - min_val
-    if math.abs(v_span) < EPSILON then
+    local mode = EnvScale.scaling_mode(envelope)
+    local d_lo = EnvScale.raw_to_display(mode, min_val)
+    local d_hi = EnvScale.raw_to_display(mode, max_val)
+    local d_span = d_hi - d_lo
+    if math.abs(d_span) < EPSILON then
         return project_time, min_val
     end
 
-    local normalized_y = (screen_y - bounds.top) / pix_h
-    local envelope_value = max_val - (normalized_y * v_span)
+    local y_in_lane = EnvApi.clamp_client_y_to_value_axis(state, envelope, screen_y)
+    local normalized_y = (y_in_lane - v_top) / pix_h
+    local d = d_hi - (normalized_y * d_span)
+    local envelope_value = EnvScale.display_to_raw(mode, d)
 
     return project_time, envelope_value
 end
@@ -43,7 +48,10 @@ function M.envelope_to_screen(state, get_envelope_properties, project_time, enve
     local bounds = state.envelope_bounds
 
     local time_range = arrange_end - arrange_start
-    local pix_w, pix_h, center_y = get_bounds_metrics(bounds)
+    local pix_w = bounds.right - bounds.left
+    local v_top, v_bottom = EnvApi.envelope_value_axis_screen_for_mapping(state, envelope)
+    local pix_h = v_bottom - v_top
+    local center_y = (v_top + v_bottom) * 0.5
     if pix_w <= 0 or pix_h <= 0 then return nil, nil end
 
     if math.abs(time_range) < EPSILON then
@@ -56,13 +64,17 @@ function M.envelope_to_screen(state, get_envelope_properties, project_time, enve
     local min_val, max_val = get_envelope_properties(envelope)
     if not min_val then return nil, nil end
 
-    local v_span = max_val - min_val
-    if math.abs(v_span) < EPSILON then
+    local mode = EnvScale.scaling_mode(envelope)
+    local d_lo = EnvScale.raw_to_display(mode, min_val)
+    local d_hi = EnvScale.raw_to_display(mode, max_val)
+    local d_span = d_hi - d_lo
+    if math.abs(d_span) < EPSILON then
         return screen_x, center_y
     end
 
-    local value_ratio = (max_val - envelope_value) / v_span
-    local screen_y = bounds.top + value_ratio * pix_h
+    local d = EnvScale.raw_to_display(mode, envelope_value)
+    local value_ratio = (d_hi - d) / d_span
+    local screen_y = v_top + value_ratio * pix_h
 
     return screen_x, screen_y
 end
@@ -76,6 +88,12 @@ function M.setup_envelope_bounds(state, config, get_arrange_hwnd)
     -- macOS / some SWELL builds can return top>bottom or left>right; negative height breaks mapping.
     local l, r = math.min(left, right), math.max(left, right)
     local t, b = math.min(top, bottom), math.max(top, bottom)
+
+    local key = string.format("%.6g:%.6g:%.6g:%.6g", l, r, t, b)
+    if state._arrange_client_rect_key == key then
+        return true
+    end
+    state._arrange_client_rect_key = key
 
     state.envelope_bounds.left = l + 2
     state.envelope_bounds.right = r - 2
@@ -93,7 +111,8 @@ function M.point_hits_envelope_curve(state, config, envelope_to_screen, envelope
     if not envelope or not value_at_time then return false end
 
     local bounds = state.envelope_bounds
-    if mx < bounds.left or mx > bounds.right or my < bounds.top or my > bounds.bottom then
+    local v_top, v_bottom = EnvApi.envelope_value_axis_screen_for_mapping(state, envelope)
+    if mx < bounds.left or mx > bounds.right or my < v_top or my > v_bottom then
         return false
     end
 
@@ -128,12 +147,15 @@ function M.detect_envelope(state, deps)
     end
     state.sws_hover_detected = (hit ~= nil)
 
-    -- While LMB brush-drag is active, keep the locked lane even if SWS hover / lane-visible flickers off.
-    if state.target_envelope and not deps.is_envelope_lane_visible(state.target_envelope) and not state.is_dragging then
+    -- While LMB is down, keep the locked envelope and auto-item index; SWS hover follows the cursor across lanes.
+    local lmb_down = deps.lmb_down
+    local freeze_envelope_target = (lmb_down == true) or state.is_dragging
+
+    if state.target_envelope and not deps.is_envelope_lane_visible(state.target_envelope) and not freeze_envelope_target then
         deps.clear_target_envelope_state_only()
     end
 
-    if hit then
+    if hit and not freeze_envelope_target then
         if state.target_envelope ~= hit then
             state.cached_envelope_properties.envelope = nil
         end

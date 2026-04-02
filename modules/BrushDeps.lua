@@ -1,10 +1,17 @@
 local M = {}
 
+--- JS_Mouse_GetState(8): Shift — Fine (half strength on Sculpt drag; matches BrushOps).
+local JS_SHIFT = 8
+
+local function shift_fine_active()
+    if not reaper.JS_Mouse_GetState then return false end
+    return (reaper.JS_Mouse_GetState(JS_SHIFT) or 0) > 0
+end
+
 function M.new(state, config, modules)
     local core = modules.core
     local envelope = modules.envelope
     local ops = modules.ops
-    local render = modules.render
     local input = modules.input
 
     local deps = {}
@@ -45,77 +52,23 @@ function M.new(state, config, modules)
         return envelope.point_hits_envelope_curve(state, config, deps.envelope_to_screen, target_envelope, mx, my, core.envelope_value_at_time)
     end
 
-    local function record_insert_debug(mx, my, payload)
-        if not state.debug_show_insert_panel then return end
-        local env = state.target_envelope
-        local ai = state.envelope_autoitem_idx or -1
-        local proj = reaper.EnumProjects and reaper.EnumProjects(-1) or 0
-        local env_name
-        if env then
-            _, env_name = reaper.GetEnvelopeName(env)
-        end
-        local tr = env and reaper.GetEnvelopeInfo_Value(env, "P_TRACK")
-        local ptr_env = env and reaper.ValidatePtr2 and reaper.ValidatePtr2(proj, env, "TrackEnvelope*")
-        local scaling = env and reaper.GetEnvelopeScalingMode and reaper.GetEnvelopeScalingMode(env)
-        local snap_after = env and core.get_envelope_sws_snapshot(env)
-        local min_c, max_c = deps.get_envelope_properties(env)
-        local b = state.envelope_bounds
-        payload = payload or {}
-        payload.when_os = (reaper.time_precise and reaper.time_precise()) or 0
-        payload.mx = mx
-        payload.my = my
-        payload.arrange_start = state.frame_arrange_start
-        payload.arrange_end = state.frame_arrange_end
-        payload.bounds = b and { left = b.left, top = b.top, right = b.right, bottom = b.bottom } or nil
-        payload.cached_min_max = { min_val = min_c, max_val = max_c }
-        payload.envelope_name = env_name
-        payload.envelope_ptr_ok = ptr_env
-        payload.autoitem_idx = ai
-        payload.insert_action_id = config.INSERT_AT_MOUSE_ACTION_ID
-        payload.track_ptr = tr
-        payload.scaling_mode = scaling
-        payload.sws_after = snap_after
-        payload.sws_hover = state.sws_hover_detected
-        payload.envelope_detected = state.envelope_detected
-        state.debug_insert_last = payload
-    end
-
     --- One point at mouse: Main_OnCommand(INSERT_AT_MOUSE_ACTION_ID) when configured (matches shortcut path), else API insert.
     deps.insert_one_point_at_arrange_client = function(mx, my)
         if not state.target_envelope or mx == nil or my == nil then
-            if state.debug_show_insert_panel then
-                record_insert_debug(mx, my, {
-                    path = "none",
-                    success = false,
-                    fail_reason = not state.target_envelope and "no target_envelope" or "nil mouse coords",
-                })
-            end
             return false
         end
         local env = state.target_envelope
         local ai = state.envelope_autoitem_idx or -1
         local cmd_id = config.INSERT_AT_MOUSE_ACTION_ID
         if type(cmd_id) == "number" and cmd_id > 0 and reaper.Main_OnCommand then
-            local n_before = state.debug_show_insert_panel and ops.count_envelope_points(env, ai) or 0
             reaper.Main_OnCommand(cmd_id, 0)
             reaper.UpdateArrange()
-            local n_after = state.debug_show_insert_panel and ops.count_envelope_points(env, ai) or 0
-            if state.debug_show_insert_panel then
-                record_insert_debug(mx, my, {
-                    path = "Main_OnCommand",
-                    success = true,
-                    cmd_id = cmd_id,
-                    n_points_before = n_before,
-                    n_points_after = n_after,
-                    point_delta = n_after - n_before,
-                })
-            end
+            ops.enforce_min_screen_spacing(state, env, ai, deps.envelope_to_screen, core.get_distance, nil)
             return true
         end
-        local n_before = state.debug_show_insert_panel and ops.count_envelope_points(env, ai) or 0
-        local snap_before = state.debug_show_insert_panel and core.get_envelope_sws_snapshot(env) or nil
         core.prepare_envelope_for_point_insert(env)
-        local ok, idbg = ops.insert_one_point_at_screen(
+        local def_shape = core.get_envelope_default_point_shape(env, state)
+        local ok = ops.insert_one_point_at_screen(
             env,
             ai,
             mx,
@@ -123,34 +76,26 @@ function M.new(state, config, modules)
             function(x, y, e)
                 return deps.screen_to_envelope(x, y, e)
             end,
-            core.envelope_value_at_time
+            core.envelope_value_for_insert,
+            def_shape
         )
-        local n_after = state.debug_show_insert_panel and ops.count_envelope_points(env, ai) or 0
-        if state.debug_show_insert_panel then
-            record_insert_debug(mx, my, {
-                path = "InsertEnvelopePoint*",
-                success = ok,
-                n_points_before = n_before,
-                n_points_after = n_after,
-                point_delta = n_after - n_before,
-                sws_before_prepare = snap_before,
-                api_debug = idbg,
-                fail_reason = (idbg and idbg.fail_reason) or (not ok and "insert failed") or nil,
-            })
+        if ok then
+            ops.enforce_min_screen_spacing(state, env, ai, deps.envelope_to_screen, core.get_distance, nil)
         end
         return ok
     end
 
     deps.create_points_in_brush_area = function(mouse_x, mouse_y, radius, target_envelope)
         local ai = state.envelope_autoitem_idx or -1
+        local def_shape = core.get_envelope_default_point_shape(target_envelope, state)
         return ops.create_points_in_brush_area(
             state, config, mouse_x, mouse_y, radius, target_envelope, ai,
             deps.screen_to_envelope, deps.envelope_to_screen, core.get_distance, core.calculate_falloff,
-            core.envelope_value_at_time
+            deps.get_envelope_properties, core.envelope_value_for_insert, def_shape
         )
     end
 
-    --- Grab mode: first LMB — prepare + spread points across brush width in time (InsertEnvelopePoint* only).
+    --- Sculpt (Cmd): first LMB — prepare + spread points across brush width in time (InsertEnvelopePoint* only).
     deps.seed_brush_width_at_client = function(mx, my)
         if not state.target_envelope or mx == nil or my == nil then return 0 end
         core.prepare_envelope_for_point_insert(state.target_envelope)
@@ -165,11 +110,12 @@ function M.new(state, config, modules)
         )
     end
 
-    deps.sculpt_captured_points = function(captured_points, delta_x, delta_y, target_envelope, no_sort)
+    deps.sculpt_captured_points = function(captured_points, delta_x, delta_y, target_envelope)
         local ai = state.envelope_autoitem_idx or -1
         return ops.sculpt_captured_points(
-            state, config, captured_points, delta_x, delta_y, target_envelope, ai, no_sort,
-            deps.get_envelope_properties, core.clamp, core.envelope_value_at_time
+            state, config, captured_points, delta_x, delta_y, target_envelope, ai,
+            deps.get_envelope_properties, core.clamp, core.envelope_value_at_time, deps.envelope_to_screen,
+            deps.screen_to_envelope, core.get_distance
         )
     end
 
@@ -182,52 +128,46 @@ function M.new(state, config, modules)
         return core.calc_inner_brush_radius(state, config, outer_radius)
     end
 
-    deps.native_to_hud_coords = function(ctx, x_native, y_native)
-        return core.native_to_hud_coords(ctx, x_native, y_native)
+    deps.primary_modifier_short_name = function()
+        return core.primary_modifier_short_name()
     end
 
-    deps.brush_hud_interactive = function()
-        return render.brush_hud_interactive(state)
+    deps.brush_drag_kind_display = function()
+        local labels = config.BRUSH_DRAG_KIND_LABELS
+        local k
+        if state.is_dragging and state.active_sculpt_kind then
+            k = state.active_sculpt_kind
+        else
+            k = input.resolve_brush_drag_kind()
+        end
+        local label = (labels and labels[k]) or k
+        if (k == "nudge" or k == "sculpt") and shift_fine_active() then
+            label = label .. " (Fine)"
+        end
+        return label
     end
+
+    deps.arrange_client_to_imgui = function(client_x, client_y)
+        return core.arrange_client_to_imgui(state.ctx, core.get_arrange_hwnd, client_x, client_y)
+    end
+
+    deps.for_each_envelope_point = function(envelope, ai, fn)
+        return ops.for_each_envelope_point(envelope, ai, fn)
+    end
+
+    local function run_min_spacing_after_drag_if_needed()
+        if not state.target_envelope then
+            return
+        end
+        ops.enforce_min_screen_spacing(state, state.target_envelope, state.envelope_autoitem_idx or -1, deps.envelope_to_screen, core.get_distance, nil)
+    end
+    deps.run_min_spacing_after_drag_if_needed = run_min_spacing_after_drag_if_needed
 
     deps.end_drag_operation = function()
-        return input.end_drag_operation(state)
-    end
-
-    deps.clear_envelope_target = function()
-        return input.clear_envelope_target(state, deps.end_drag_operation)
-    end
-
-    --- Call immediately after ImGui_Button; uses that button's rect: Y = vertical center, X = right edge + DEBUG_SYNTHETIC_OFFSET_X.
-    deps.debug_synthetic_insert_from_last_item = function(ctx)
-        if not ctx or not state.target_envelope then return end
-        if not reaper.ImGui_GetItemRectMin or not reaper.ImGui_GetItemRectMax then return end
-        local l, t = reaper.ImGui_GetItemRectMin(ctx)
-        local r, b = reaper.ImGui_GetItemRectMax(ctx)
-        if not l or not t or not r or not b then return end
-        local mid_y = (t + b) * 0.5
-        local lx = r + config.DEBUG_SYNTHETIC_OFFSET_X
-        local ly = mid_y
-        local cx, cy = core.imgui_window_local_to_arrange_client(ctx, lx, ly, core.get_arrange_hwnd)
-        if cx == nil or cy == nil then return end
-        local bounds = state.envelope_bounds
-        cx = core.clamp(cx, bounds.left, bounds.right)
-        cy = core.clamp(cy, bounds.top, bounds.bottom)
-        if reaper.PreventUIRefresh then
-            reaper.PreventUIRefresh(1)
-        end
-        reaper.Undo_BeginBlock()
-        local n = ops.create_points_in_brush_area(
-            state, config, cx, cy, state.brush_size, state.target_envelope, state.envelope_autoitem_idx or -1,
-            deps.screen_to_envelope, deps.envelope_to_screen, core.get_distance, core.calculate_falloff,
-            core.envelope_value_at_time
-        ) or 0
-        reaper.Undo_EndBlock("Debug synthetic brush insert", -1)
-        if reaper.PreventUIRefresh then
-            reaper.PreventUIRefresh(-1)
-        end
-        reaper.UpdateArrange()
-        return n
+        return input.end_drag_operation(state, {
+            sort_envelope_points_for_autoitem = ops.sort_envelope_points_for_autoitem,
+            enforce_min_spacing_after_drag = run_min_spacing_after_drag_if_needed,
+        })
     end
 
     return deps
