@@ -47,8 +47,9 @@ return {
     SCULPT_DRAG_MIN_MOVEMENT_PX = 0.02,
     --- Envelope_SortPoints* cadence while sculpting (seconds). First tick after drag start sorts immediately (no prior time).
     ENVELOPE_SORT_INTERVAL_SEC = 0.25,
-    -- Smooth (Shift+LMB): per mouse move, blend toward mean Y and even time spacing across brush; base × this slider × falloff × power.
-    SMOOTH_SETTLE_BASE_PER_MOVE = 0.0005, -- 0.05% per move before strength slider
+    -- Smooth (Shift+LMB): per mouse move, blend toward mean Y and even time spacing across brush; this × smooth strength × falloff × power.
+    -- Must be large enough that default strength produces a visible step per sculpt tick (was 0.0005 → ~0.01% blend/move, effectively inert).
+    SMOOTH_SETTLE_BASE_PER_MOVE = 0.2,
     DEFAULT_SMOOTH_STRENGTH = 0.2,
     MIN_SMOOTH_STRENGTH = 0.02,
     MAX_SMOOTH_STRENGTH = 1.0,
