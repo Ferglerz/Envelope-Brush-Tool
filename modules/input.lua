@@ -1,5 +1,8 @@
 local M = {}
 
+local DIR = debug.getinfo(1, "S").source:match("^@(.+[\\/])") or ""
+local Mods = dofile(DIR .. "mods.lua")
+
 local function imgui_mouse_wheel_sum(state)
     local w = 0
     if state.ctx then
@@ -8,46 +11,44 @@ local function imgui_mouse_wheel_sum(state)
     return w
 end
 
---- Wheel modifiers: js_ReaScript JS_Mouse_GetState (global), not ImGui_GetKeyMods.
---- Same function uses button ids (1 = LMB) and, for Alt only, VK_MENU (0x12) — not bit 32 (that is VK_SPACE).
---- WM_MOUSEWHEEL wParam LOWORD: MK_SHIFT 0x0004, MK_CONTROL 0x0008.
---- Masks (js extension convention): 8 = Shift, 4 = Ctrl, 16 = Command (macOS), 32 used elsewhere — not Alt.
-local MK_SHIFT = 0x0004
-local MK_CONTROL = 0x0008
-local JS_SHIFT = 8
-local VK_MENU = 0x12 -- Alt / Option: use with JS_Mouse_GetState for wheel falloff only
+--- Wheel modifiers: js_ReaScript JS_Mouse_GetState (global), not ImGui_GetKeyMods; WM wParam masks in mods.lua.
 local VK_ESCAPE = 0x1B
+local VK_X = 0x58
+local VK_Y = 0x59
 
 local function js_mod_down(bit)
     if not reaper.JS_Mouse_GetState then return false end
     return (reaper.JS_Mouse_GetState(bit) or 0) > 0
 end
 
---- Sculpt: Cmd (16) or Ctrl (4). Smooth: Shift (8). Sculpt wins when combined with Shift.
+local function sculpt_modifier_down_js()
+    return js_mod_down(Mods.JS_CTRL) or js_mod_down(Mods.JS_CMD)
+end
+
+--- Sculpt: Cmd or Ctrl. Smooth: Shift. Sculpt wins when combined with Shift.
 function M.resolve_brush_drag_kind()
-    if js_mod_down(16) or js_mod_down(4) then
+    if sculpt_modifier_down_js() then
         return "sculpt"
     end
-    if js_mod_down(JS_SHIFT) then
+    if js_mod_down(Mods.JS_SHIFT) then
         return "smooth"
     end
     return "nudge"
 end
 
---- Alt/Option for wheel: VK_MENU (0x12). Bitmask 32 maps to VK_SPACE, not Menu.
 local function wheel_mod_alt()
     if not reaper.JS_Mouse_GetState then return false end
-    return (reaper.JS_Mouse_GetState(VK_MENU) or 0) > 0
+    return (reaper.JS_Mouse_GetState(Mods.VK_MENU) or 0) > 0
 end
 
 local function wheel_mod_shift(arrange_wparam_lo)
     local js = false
     if reaper.JS_Mouse_GetState then
-        js = (reaper.JS_Mouse_GetState(8) or 0) > 0
+        js = (reaper.JS_Mouse_GetState(Mods.JS_SHIFT) or 0) > 0
     end
     if arrange_wparam_lo then
         local lo = arrange_wparam_lo & 0xFFFF
-        if (lo & MK_SHIFT) ~= 0 then return true end
+        if (lo & Mods.MK_SHIFT) ~= 0 then return true end
     end
     return js
 end
@@ -55,13 +56,13 @@ end
 local function wheel_mod_power_cmd_ctrl(arrange_wparam_lo)
     local js = false
     if reaper.JS_Mouse_GetState then
-        local a = reaper.JS_Mouse_GetState(4) or 0
-        local b = reaper.JS_Mouse_GetState(16) or 0
+        local a = reaper.JS_Mouse_GetState(Mods.JS_CTRL) or 0
+        local b = reaper.JS_Mouse_GetState(Mods.JS_CMD) or 0
         js = a > 0 or b > 0
     end
     if arrange_wparam_lo then
         local lo = arrange_wparam_lo & 0xFFFF
-        if (lo & MK_CONTROL) ~= 0 then return true end
+        if (lo & Mods.MK_CONTROL) ~= 0 then return true end
     end
     return js
 end
@@ -84,13 +85,50 @@ function M.brush_wheel_context_active(state)
     return false
 end
 
-local function brush_wheel_context_active(state)
-    return M.brush_wheel_context_active(state)
-end
-
 local function imgui_key_pressed_any(state, key)
     if state.ctx and reaper.ImGui_IsKeyPressed(state.ctx, key) then return true end
     return false
+end
+
+--- js_ReaScript: JS_VKeys_GetState(0) returns a byte string indexed by VK (Escape = 27 / 0x1B).
+local function js_vkeys_down(vk)
+    if not reaper.JS_VKeys_GetState or type(vk) ~= "number" then
+        return false
+    end
+    local s = reaper.JS_VKeys_GetState(0)
+    if type(s) ~= "string" or vk < 1 or vk > #s then
+        return false
+    end
+    return s:byte(vk) == 1
+end
+
+local function js_vkey_pressed_edge(state, vk, prev_field)
+    local down = js_vkeys_down(vk)
+    local prev = state[prev_field]
+    state[prev_field] = down
+    if prev == nil then return false end
+    return down and not prev
+end
+
+local function key_pressed_edge(state, vk, prev_field, imgui_key_fn)
+    if imgui_key_fn and imgui_key_pressed_any(state, imgui_key_fn()) then
+        return true
+    end
+    return js_vkey_pressed_edge(state, vk, prev_field)
+end
+
+local function toggle_lock_time_axis(state)
+    state.lock_time_axis = not state.lock_time_axis
+    if state.lock_time_axis then
+        state.lock_value_axis = false
+    end
+end
+
+local function toggle_lock_value_axis(state)
+    state.lock_value_axis = not state.lock_value_axis
+    if state.lock_value_axis then
+        state.lock_time_axis = false
+    end
 end
 
 local function begin_undo_once(state, name)
@@ -134,12 +172,13 @@ function M.apply_envelope_undo_finalize(state, opts)
     end
 end
 
+--- LMB release: optional opts.cleanup_redundant_points_after_drag (smooth-only angle cleanup in deps).
 function M.end_drag_operation(state, opts)
     if not state.is_dragging then
         return
     end
-    if opts and opts.enforce_min_spacing_after_drag then
-        opts.enforce_min_spacing_after_drag()
+    if opts and opts.cleanup_redundant_points_after_drag then
+        opts.cleanup_redundant_points_after_drag()
     end
     clear_drag_pointer_state(state)
     M.apply_envelope_undo_finalize(state, opts)
@@ -148,9 +187,6 @@ end
 --- Script exit: same undo/sort rules as end_drag_operation, but also runs when not dragging (orphaned undo block).
 function M.end_session_from_script_close(state, opts)
     if state.is_dragging then
-        if opts and opts.enforce_min_spacing_after_drag then
-            opts.enforce_min_spacing_after_drag()
-        end
         clear_drag_pointer_state(state)
     end
     M.apply_envelope_undo_finalize(state, opts)
@@ -164,7 +200,7 @@ end
 --- Integrate brush-size wheel coast (plain scroll only; call before handle_wheel_input each frame).
 function M.tick_wheel_momentum(state, config, clamp)
     if not state.ctx then return end
-    if not brush_wheel_context_active(state) then
+    if not M.brush_wheel_context_active(state) then
         M.clear_wheel_momentum(state)
         return
     end
@@ -218,7 +254,7 @@ end
 --- Arrange wheel: intercepted (blocked); eaten for brush when context active, else forwarded to arrange.
 function M.handle_wheel_input(state, config, clamp, core)
     if not state.ctx then return false end
-    local brush_ctx = brush_wheel_context_active(state)
+    local brush_ctx = M.brush_wheel_context_active(state)
     local wm, arrange_wparam_lo = 0, nil
     if core and core.take_arrange_wheel_or_forward then
         wm, arrange_wparam_lo = core.take_arrange_wheel_or_forward(state, brush_ctx)
@@ -262,58 +298,84 @@ function M.handle_wheel_input(state, config, clamp, core)
     return true
 end
 
---- True once on physical Esc down while settings open (ImGui may not see key over arrange).
-local function js_escape_pressed_edge(state)
-    if not reaper.JS_VKeys_GetState then return false end
-    local down = (reaper.JS_VKeys_GetState(VK_ESCAPE) or 0) ~= 0
-    if not state.brush_settings_mode then
-        state._brush_settings_esc_js_prev = down
-        return false
-    end
-    local pressed = down and not state._brush_settings_esc_js_prev
-    state._brush_settings_esc_js_prev = down
-    return pressed
+local function sync_escape_key_prev(state)
+    local down = js_vkeys_down(VK_ESCAPE)
+    state._brush_settings_esc_prev = down
+    state._vk_prev_esc = down
 end
 
---- LMB on non-widget (arrange, void, other windows) exits brush settings mode.
-function M.tick_brush_settings_lmb_dismiss(state)
-    if not state.brush_settings_mode or not state.ctx then
-        return
-    end
-    if not reaper.ImGui_IsMouseClicked or not reaper.ImGui_IsAnyItemHovered then
-        return
-    end
-    local ctx = state.ctx
-    local btn = 0
-    if reaper.ImGui_MouseButton_Left then
-        local ml = reaper.ImGui_MouseButton_Left
-        btn = type(ml) == "function" and ml() or ml
-    end
-    if not reaper.ImGui_IsMouseClicked(ctx, btn) then
-        return
-    end
-    if reaper.ImGui_IsAnyItemHovered(ctx) then
+function M.close_brush_settings(state)
+    if not state.brush_settings_mode then
         return
     end
     state.brush_settings_mode = false
     state.brush_settings_freeze_client = nil
+    state._brush_settings_panel_rect_imgui = nil
+    state._brush_settings_js_lmb_prev = nil
+    if state.ctx and reaper.ImGui_CloseCurrentPopup then
+        pcall(reaper.ImGui_CloseCurrentPopup, state.ctx)
+    end
+    sync_escape_key_prev(state)
+end
+
+--- JS LMB press edge + `GetMousePosition`→ImGui (same space as `##BrushHudPanel` rect). Arrange clicks often never reach `ImGui_IsMouseClicked`.
+function M.tick_brush_settings_lmb_dismiss(state, deps)
+    if not state.brush_settings_mode or not state.ctx then
+        return
+    end
+    if not deps or not deps.get_mouse_imgui_xy or not deps.is_lmb_down_js then
+        return
+    end
+    local down = deps.is_lmb_down_js()
+    if state._brush_settings_js_lmb_prev == nil then
+        state._brush_settings_js_lmb_prev = down
+        return
+    end
+    local prev = state._brush_settings_js_lmb_prev
+    state._brush_settings_js_lmb_prev = down
+    if not (down and not prev) then
+        return
+    end
+    local rect = state._brush_settings_panel_rect_imgui
+    if not rect then
+        return
+    end
+    local mx, my = deps.get_mouse_imgui_xy()
+    if type(mx) ~= "number" or type(my) ~= "number" then
+        return
+    end
+    local x1, y1, x2, y2 = rect[1], rect[2], rect[3], rect[4]
+    if mx >= x1 and mx <= x2 and my >= y1 and my <= y2 then
+        return
+    end
+    M.close_brush_settings(state)
 end
 
 function M.handle_keyboard_input(state, deps)
     if not state.ctx then return false end
 
-    local esc_imgui = imgui_key_pressed_any(state, reaper.ImGui_Key_Escape())
-    if state.brush_settings_mode and (js_escape_pressed_edge(state) or esc_imgui) then
-        state.brush_settings_mode = false
-        state.brush_settings_freeze_client = nil
-        return true
-    end
-
-    if esc_imgui then
+    -- Escape: JS edges only (arrange keeps focus). First Esc closes settings; second closes script.
+    if state.brush_settings_mode then
+        if js_vkey_pressed_edge(state, VK_ESCAPE, "_brush_settings_esc_prev") then
+            M.close_brush_settings(state)
+            return true
+        end
+    elseif js_vkey_pressed_edge(state, VK_ESCAPE, "_vk_prev_esc") then
         if deps.request_script_close then
             deps.request_script_close()
         end
         return true
+    end
+
+    if state.target_envelope then
+        if key_pressed_edge(state, VK_X, "_vk_prev_x", reaper.ImGui_Key_X) then
+            toggle_lock_time_axis(state)
+            return true
+        end
+        if key_pressed_edge(state, VK_Y, "_vk_prev_y", reaper.ImGui_Key_Y) then
+            toggle_lock_value_axis(state)
+            return true
+        end
     end
 
     return false
@@ -321,7 +383,7 @@ end
 
 local RMB_DRAG_THRESH_PX = 8
 
---- RMB up without drag on brush lane: toggle frozen HUD settings mode (see BrushRender.render_brush_hud_panel).
+--- RMB up without drag on brush lane: toggle frozen HUD settings mode (see render.render_brush_hud_panel).
 function M.tick_rmb_brush_settings(state, brush_context_ok, mouse_x, mouse_y)
     if not reaper.JS_Mouse_GetState then return end
     local rmb_down = (reaper.JS_Mouse_GetState(2) or 0) > 0
@@ -339,39 +401,18 @@ function M.tick_rmb_brush_settings(state, brush_context_ok, mouse_x, mouse_y)
     if not rmb_down and state._rmb_down_prev then
         if state._rmb_press_client and not state._rmb_dragged and brush_context_ok then
             if state.brush_settings_mode then
-                state.brush_settings_mode = false
-                state.brush_settings_freeze_client = nil
+                M.close_brush_settings(state)
             else
                 state.brush_settings_mode = true
                 state.brush_settings_freeze_client = { x = state._rmb_press_client.x, y = state._rmb_press_client.y }
-                if reaper.JS_VKeys_GetState then
-                    state._brush_settings_esc_js_prev = (reaper.JS_VKeys_GetState(VK_ESCAPE) or 0) ~= 0
-                else
-                    state._brush_settings_esc_js_prev = false
-                end
+                sync_escape_key_prev(state)
+                local lmb = (reaper.JS_Mouse_GetState(1) or 0) % 2 >= 1
+                state._brush_settings_js_lmb_prev = lmb
             end
         end
         state._rmb_press_client = nil
     end
     state._rmb_down_prev = rmb_down
-end
-
---- Tab: JS_VKeys (global), gated to brush_wheel_context_active — works over arrange without ImGui focus.
-local VK_TAB = 0x09
-
-function M.handle_tab_cycle_falloff(state, deps)
-    if not reaper.JS_VKeys_GetState or not deps or not deps.falloff_types then return false end
-    local down = (reaper.JS_VKeys_GetState(VK_TAB) or 0) ~= 0
-    local pressed = down and not state._vk_tab_down_prev
-    state._vk_tab_down_prev = down
-    if not pressed or not M.brush_wheel_context_active(state) then
-        return false
-    end
-    state.falloff_type = state.falloff_type + 1
-    if state.falloff_type > #deps.falloff_types then
-        state.falloff_type = 1
-    end
-    return true
 end
 
 local function sculpt_delta_below_threshold(dx, dy, config)
@@ -383,7 +424,7 @@ function M.try_apply_sculpt_drag(state, config, mx, my, deps)
     if not state.target_envelope or state.drag_mode ~= "sculpt" then return end
 
     local kind = state.active_sculpt_kind or "nudge"
-    local continuous_smooth = kind == "smooth" and state.enable_continuous_smoothing
+    local continuous_smooth = kind == "smooth"
 
     -- Fixed capture at LMB: nothing to sculpt — keep last_client in sync with the pointer.
     if #state.captured_points == 0 and not continuous_smooth then
@@ -449,12 +490,16 @@ function M.on_lmb_pressed(state, config, mx, my, deps)
     state.drag_mode = (kind == "sculpt") and "combined" or "sculpt"
     state.drag_start_pos = { x = mx, y = my }
     state.sculpt_sort_pending = false
-    state.last_envelope_sort_os = nil
+    -- Non-nil: skip an immediate full sort on the first sculpt/nudge tick (see core.tick_throttled_envelope_sort_if_due).
+    state.last_envelope_sort_os = (reaper.time_precise and reaper.time_precise()) or 0
     state.envelope_points_dirty_sort = false
     state.sculpt_last_client = { x = mx, y = my }
 
     if kind == "nudge" or kind == "smooth" then
         state.captured_points = deps.capture_points_in_radius(mx, my, state.brush_size, state.target_envelope)
+        if deps.sync_brush_point_selection then
+            deps.sync_brush_point_selection(state.target_envelope, state.captured_points)
+        end
         return
     end
 
@@ -466,6 +511,9 @@ function M.on_lmb_pressed(state, config, mx, my, deps)
         state.undo_operation_name = "Brush Sculpt Envelope"
     end
     state.captured_points = deps.capture_points_in_radius(mx, my, state.brush_size, state.target_envelope)
+    if deps.sync_brush_point_selection then
+        deps.sync_brush_point_selection(state.target_envelope, state.captured_points)
+    end
 end
 
 return M

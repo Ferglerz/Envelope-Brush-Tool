@@ -2,6 +2,18 @@
 
 local M = {}
 
+local function scaling_mode(envelope)
+    if not envelope then return 0 end
+    return reaper.GetEnvelopeScalingMode(envelope) or 0
+end
+
+local function api_value_to_linear(envelope, value)
+    if type(value) ~= "number" then return value end
+    local mode = scaling_mode(envelope)
+    if mode == 0 then return value end
+    return reaper.ScaleFromEnvelopeMode(mode, value)
+end
+
 --- ReaScript: Envelope_Evaluate(env, time, samplerate, samplesRequested). (time, 0, 0) is not valid (sr=0).
 function M.envelope_value_at_time(envelope, time_pos)
     if not envelope or time_pos == nil then return nil end
@@ -14,7 +26,7 @@ function M.envelope_value_at_time(envelope, time_pos)
         end
     end
     local _, val = reaper.Envelope_Evaluate(envelope, time_pos, sr, 1)
-    if val ~= nil then return val end
+    if val ~= nil then return api_value_to_linear(envelope, val) end
     return nil
 end
 
@@ -88,18 +100,18 @@ function M.envelope_insert_evaluate_times(envelope, project_time, autoitem_idx)
     return project_time, project_time
 end
 
---- Value for new points: Envelope_Evaluate at evaluate_time with device SRATE/BSIZE. Returns value, insert_time, evaluate_time (all nil on failure).
+--- Value for new points from REAPER evaluator (linear domain, shape/scaling aware).
+--- Returns linear_value_for_insert, insert_time, evaluate_time (all nil on failure).
 function M.envelope_value_for_insert(envelope, project_time, autoitem_idx)
     local insert_t, eval_t = M.envelope_insert_evaluate_times(envelope, project_time, autoitem_idx)
     if insert_t == nil or eval_t == nil then
         return nil, nil, nil
     end
-    local sr, ns = M.envelope_evaluate_device_params()
-    local _, val = reaper.Envelope_Evaluate(envelope, eval_t, sr, ns)
-    if val == nil then
+    local value_linear = M.envelope_value_at_time(envelope, eval_t)
+    if value_linear == nil or type(value_linear) ~= "number" or value_linear ~= value_linear then
         return nil, insert_t, eval_t
     end
-    return val, insert_t, eval_t
+    return value_linear, insert_t, eval_t
 end
 
 --- Default point shape from envelope state chunk (DEFSHAPE <n> ...); fallback 0. Caches per `state` + envelope pointer.
@@ -126,21 +138,14 @@ function M.get_envelope_default_point_shape(envelope, state)
     return sh
 end
 
---- Arrange-client Y range [top, bottom) for this envelope's value lane (same space as JS arrange HWND + brush mouse map).
---- Track I_TCPY is relative to the top of the arrange view; envelope offsets are relative to that track.
---- Prefer I_TCPY_USED / I_TCPH_USED (drawable value area, no padding). Full I_TCPH includes padding; mapping 0..16
---- raw across padded height makes the visible curve occupy a thin band of normalized Y — e.g. "top" of the drawn
---- lane maps to a very low raw (-100+ dB on volume) instead of the lane trim max.
-function M.envelope_value_axis_client_y(envelope)
+--- Arrange-client Y range [top, bottom) for this envelope's drawable value area.
+--- Single-path rule: use I_TCPY_USED + I_TCPH_USED for all envelopes.
+function M.envelope_value_axis_client_y(state, envelope)
     if not envelope or not reaper.GetEnvelopeInfo_Value or not reaper.GetMediaTrackInfo_Value then
         return nil, nil
     end
     local tr = reaper.GetEnvelopeInfo_Value(envelope, "P_TRACK")
     if not tr or tr == 0 then
-        return nil, nil
-    end
-    local proj = reaper.EnumProjects and reaper.EnumProjects(-1) or 0
-    if reaper.ValidatePtr2 and not reaper.ValidatePtr2(proj, tr, "MediaTrack*") then
         return nil, nil
     end
     local track_y = reaper.GetMediaTrackInfo_Value(tr, "I_TCPY")
@@ -150,27 +155,143 @@ function M.envelope_value_axis_client_y(envelope)
     local env_y = reaper.GetEnvelopeInfo_Value(envelope, "I_TCPY_USED")
     local env_h = reaper.GetEnvelopeInfo_Value(envelope, "I_TCPH_USED")
     if type(env_y) ~= "number" or type(env_h) ~= "number" or env_h < 1 then
-        env_y = reaper.GetEnvelopeInfo_Value(envelope, "I_TCPY")
-        env_h = reaper.GetEnvelopeInfo_Value(envelope, "I_TCPH")
-    end
-    if type(env_y) ~= "number" or type(env_h) ~= "number" or env_h < 1 then
         return nil, nil
     end
     local top = track_y + env_y
     return top, top + env_h
 end
 
---- Top/bottom for value↔pixel mapping: real envelope lane when API succeeds, else `state.envelope_bounds` (arrange fallback).
+--- Top/bottom for value↔pixel mapping: strict lane mapping only (no fallback).
 function M.envelope_value_axis_screen_for_mapping(state, envelope)
-    local vt, vb = M.envelope_value_axis_client_y(envelope)
-    local b = state and state.envelope_bounds
-    if not b then
+    local vt, vb = M.envelope_value_axis_client_y(state, envelope)
+    if vt == nil or vb == nil or vb <= vt then
         return nil, nil
     end
-    if vt == nil or vb == nil or vb <= vt then
-        return b.top, b.bottom
-    end
     return vt, vb
+end
+
+--- Timeline time at arrange client X (sampled via GetSet_ArrangeView2 in native screen space).
+local function arrange_time_at_client_x(arrange_hwnd, client_x)
+    if not arrange_hwnd or type(client_x) ~= "number" then
+        return nil
+    end
+    if not reaper.GetSet_ArrangeView2 then
+        return nil
+    end
+    -- GetSet_ArrangeView2 uses arrange-view horizontal pixel space; feed arrange client X directly.
+    local x0 = math.floor(client_x)
+    local t0, t1 = reaper.GetSet_ArrangeView2(0, false, x0, x0 + 1)
+    if type(t0) ~= "number" or t0 ~= t0 then
+        return nil
+    end
+    if type(t1) == "number" and t1 == t1 then
+        return 0.5 * (t0 + t1)
+    end
+    return t0
+end
+
+--- Arrange client X span where timeline time actually advances.
+--- Returns timeline_left, timeline_right (inclusive client X) or nil,nil.
+function M.arrange_timeline_client_bounds_x(state, arrange_hwnd, client_left, client_right)
+    if not state or not arrange_hwnd then
+        return nil, nil
+    end
+    if type(client_left) ~= "number" or type(client_right) ~= "number" then
+        return nil, nil
+    end
+    local x0 = math.floor(math.min(client_left, client_right))
+    local x1 = math.floor(math.max(client_left, client_right))
+    if x1 <= x0 then
+        return x0, x1
+    end
+
+    local arrange_start = state.frame_arrange_start
+    local arrange_end = state.frame_arrange_end
+    if type(arrange_start) ~= "number" or type(arrange_end) ~= "number" or arrange_end <= arrange_start then
+        return nil, nil
+    end
+
+    local left_time = arrange_time_at_client_x(arrange_hwnd, x0)
+    if left_time == nil then
+        return nil, nil
+    end
+
+    local right_time = arrange_time_at_client_x(arrange_hwnd, x1)
+    if right_time == nil then
+        return nil, nil
+    end
+    local span = arrange_end - arrange_start
+    local start_threshold = arrange_start + math.max(1e-9, span * 1e-6)
+    local end_threshold = arrange_end - math.max(1e-9, span * 1e-6)
+
+    local timeline_left = x0
+    if left_time <= start_threshold then
+        if right_time <= start_threshold then
+            return nil, nil
+        end
+        local lo, hi = x0, x1
+        while (hi - lo) > 1 do
+            local mid = math.floor((lo + hi) * 0.5)
+            local tm = arrange_time_at_client_x(arrange_hwnd, mid)
+            if tm == nil then
+                return nil, nil
+            end
+            if tm > start_threshold then
+                hi = mid
+            else
+                lo = mid
+            end
+        end
+        timeline_left = hi
+    end
+
+    local timeline_right = x1
+    if right_time >= end_threshold then
+        if left_time >= end_threshold then
+            return nil, nil
+        end
+        local lo, hi = x0, x1
+        while (hi - lo) > 1 do
+            local mid = math.floor((lo + hi) * 0.5)
+            local tm = arrange_time_at_client_x(arrange_hwnd, mid)
+            if tm == nil then
+                return nil, nil
+            end
+            if tm >= end_threshold then
+                hi = mid
+            else
+                lo = mid
+            end
+        end
+        timeline_right = lo
+    end
+
+    if timeline_right <= timeline_left then
+        return nil, nil
+    end
+    return timeline_left, timeline_right
+end
+
+--- Set envelope_bounds.left/right from arrange-time span, not TCP/client width.
+--- Returns true on success; leaves bounds unchanged on failure.
+function M.apply_timeline_x_to_envelope_bounds(state, arrange_hwnd, client_left_fallback, client_right_bound)
+    local b = state and state.envelope_bounds
+    if not b then return false end
+    local tl, tr = M.arrange_timeline_client_bounds_x(state, arrange_hwnd, client_left_fallback, client_right_bound)
+    if type(tl) == "number" and type(tr) == "number" and tr > tl then
+        b.left = tl
+        b.right = tr
+        return true
+    end
+    return false
+end
+
+--- Brush center for radial screen capture and HUD rings (ScreenToClient + lane Y).
+function M.brush_center_client_xy(state, envelope, mouse_x, mouse_y)
+    if type(mouse_x) ~= "number" then
+        return nil, M.clamp_client_y_to_value_axis(state, envelope, mouse_y)
+    end
+    return mouse_x, M.clamp_client_y_to_value_axis(state, envelope, mouse_y)
 end
 
 --- Clamp arrange-client Y into the envelope value lane so ruler / dead space above the lane do not skew value mapping.
@@ -191,30 +312,34 @@ function M.clamp_client_y_to_value_axis(state, envelope, y)
     return y
 end
 
---- Raw min/max for ScaleFromEnvelopeMode + GetEnvelopePoint (REAPER: point APIs use one raw storage space).
+--- Raw min/max for envelope scaling helpers + GetEnvelopePoint (REAPER: point APIs use one raw storage space).
 --- SWS BR_EnvGetProperties returns LaneMinValue/LaneMaxValue: the raw range that spans the drawable lane for the
 --- current volenvrange / trim. That range must pair with I_TCP*_USED pixel height — not padded I_TCPH nor fixed 0..16.
 function M.get_envelope_properties(state, envelope)
-    if not envelope then return nil, nil end
+    if not envelope then return nil, nil, nil, nil end
 
     if state.cached_envelope_properties.envelope == envelope then
-        return state.cached_envelope_properties.min_val, state.cached_envelope_properties.max_val
+        local c = state.cached_envelope_properties
+        return c.min_val, c.max_val, c.center_val, c.scaling_mode
     end
 
     local br_env = reaper.BR_EnvAlloc(envelope, M.envelope_is_take_envelope(envelope))
-    if not br_env then return nil, nil end
+    if not br_env then return nil, nil, nil, nil end
     -- Return order per SWS BR_ReaScript.cpp: ... centerValue, type, faderScaling, AIoptions
-    local _, _, _, _, _, _, min_val, max_val = reaper.BR_EnvGetProperties(br_env)
+    local _, _, _, _, _, _, min_val, max_val, center_val = reaper.BR_EnvGetProperties(br_env)
     reaper.BR_EnvFree(br_env, false)
-    if min_val == nil or max_val == nil then
-        return nil, nil
+    local scaling_mode = reaper.GetEnvelopeScalingMode(envelope)
+    if min_val == nil or max_val == nil or center_val == nil or scaling_mode == nil then
+        return nil, nil, nil, nil
     end
 
     state.cached_envelope_properties.envelope = envelope
     state.cached_envelope_properties.min_val = min_val
     state.cached_envelope_properties.max_val = max_val
+    state.cached_envelope_properties.center_val = center_val
+    state.cached_envelope_properties.scaling_mode = scaling_mode
 
-    return min_val, max_val
+    return min_val, max_val, center_val, scaling_mode
 end
 
 function M.is_envelope_lane_visible(envelope)

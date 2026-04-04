@@ -1,9 +1,11 @@
 local M = {}
 
-local JS_SHIFT = 8
+local SCRIPT_PATH = debug.getinfo(1, "S").source:match("^@(.+)$") or ""
+local SCRIPT_DIR = SCRIPT_PATH:match("^(.*[\\/])") or ""
+local Mods = dofile(SCRIPT_DIR .. "mods.lua")
 
 local function shift_fine_active()
-    return reaper.JS_Mouse_GetState and (reaper.JS_Mouse_GetState(JS_SHIFT) or 0) > 0
+    return reaper.JS_Mouse_GetState and (reaper.JS_Mouse_GetState(Mods.JS_SHIFT) or 0) > 0
 end
 
 function M.new(state, config, modules)
@@ -11,9 +13,16 @@ function M.new(state, config, modules)
     local deps = {}
 
     deps.get_mouse_client_xy = function() return core.get_mouse_client_xy(state.ctx, core.get_arrange_hwnd) end
+    deps.brush_center_client_xy = function(mx, my)
+        return core.brush_center_client_xy(state, state.target_envelope, mx, my)
+    end
     deps.get_arrange_imgui_overlay_geometry = function() return core.get_arrange_imgui_overlay_geometry(state.ctx, core.get_arrange_hwnd) end
     deps.get_mouse_imgui_xy = function() return core.get_mouse_imgui_xy(state.ctx) end
     deps.get_envelope_properties = function(target_envelope) return core.get_envelope_properties(state, target_envelope) end
+    deps.envelope_value_at_time = function(env, t) return core.envelope_value_at_time(env, t) end
+    deps.envelope_value_for_insert = function(env, t)
+        return core.envelope_value_for_insert(env, t, state.envelope_autoitem_idx or -1)
+    end
 
     deps.screen_to_envelope = function(x, y, env)
         return envelope.screen_to_envelope(state, deps.get_envelope_properties, x, y, env)
@@ -34,23 +43,14 @@ function M.new(state, config, modules)
     deps.insert_one_point_at_arrange_client = function(mx, my)
         local env = state.target_envelope
         if not env or mx == nil or my == nil then return false end
-        local ai, cmd_id = state.envelope_autoitem_idx or -1, config.arrange.INSERT_AT_MOUSE_ACTION_ID
-        if type(cmd_id) == "number" and cmd_id > 0 and reaper.Main_OnCommand then
-            reaper.Main_OnCommand(cmd_id, 0)
-            reaper.UpdateArrange()
-            ops.enforce_min_screen_spacing(state, env, ai, deps.envelope_to_screen, core.get_distance, nil)
-            return true
-        end
-        core.prepare_envelope_for_point_insert(env)
+        local ai = state.envelope_autoitem_idx or -1
+        core.prepare_envelope_for_point_insert(env, state)
         local ok = ops.insert_one_point_at_screen(
             env, ai, mx, my,
             deps.screen_to_envelope,
             core.envelope_value_for_insert,
             core.get_envelope_default_point_shape(env, state)
         )
-        if ok then
-            ops.enforce_min_screen_spacing(state, env, ai, deps.envelope_to_screen, core.get_distance, nil)
-        end
         return ok
     end
 
@@ -59,15 +59,64 @@ function M.new(state, config, modules)
         return ops.create_points_in_brush_area(
             state, config, mx, my, radius, env, ai,
             deps.screen_to_envelope, deps.envelope_to_screen, core.get_distance,
-            deps.get_envelope_properties, core.envelope_value_for_insert, core.get_envelope_default_point_shape(env, state)
+            deps.get_envelope_properties, core.envelope_value_for_insert, core.get_envelope_default_point_shape(env, state),
+            state.seed_hover_cache
         )
     end
 
     deps.seed_brush_width_at_client = function(mx, my)
         local env = state.target_envelope
         if not env or mx == nil or my == nil then return 0 end
-        core.prepare_envelope_for_point_insert(env)
-        return deps.create_points_in_brush_area(mx, my, state.brush_size, env)
+        core.prepare_envelope_for_point_insert(env, state)
+        local n = deps.create_points_in_brush_area(mx, my, state.brush_size, env)
+        state.seed_hover_cache = nil
+        state.seed_hover_last_client = nil
+        return n
+    end
+
+    deps.warm_seed_cache_for_hover = function(mx, my)
+        local env = state.target_envelope
+        if not env or mx == nil or my == nil or state.is_dragging then
+            return false
+        end
+        local scfg = config.seed or {}
+        if not scfg.HOVER_WARM_ENABLED then
+            return false
+        end
+        local now = reaper.time_precise and reaper.time_precise() or 0
+        local min_iv = scfg.HOVER_WARM_INTERVAL_SEC or 0.05
+        local min_move = scfg.HOVER_WARM_MIN_MOUSE_MOVE_PX or 2
+        local prev = state.seed_hover_last_client
+        local moved = true
+        if prev then
+            local dx = mx - prev.x
+            local dy = my - prev.y
+            moved = (dx * dx + dy * dy) >= (min_move * min_move)
+        end
+        local cache = state.seed_hover_cache
+        local age = (cache and cache.built_os) and (now - cache.built_os) or math.huge
+        local same_env = cache
+            and cache.envelope == env
+            and (cache.autoitem_idx or -1) == (state.envelope_autoitem_idx or -1)
+            and math.abs((cache.brush_size or 0) - (state.brush_size or 0)) <= 1e-9
+        if not moved and same_env and age < min_iv then
+            return false
+        end
+        state.seed_hover_cache = ops.build_seed_screen_point_cache(
+            state,
+            config,
+            mx,
+            my,
+            state.brush_size,
+            env,
+            state.envelope_autoitem_idx or -1,
+            deps.screen_to_envelope,
+            deps.envelope_to_screen,
+            deps.get_envelope_properties,
+            core.envelope_value_for_insert
+        )
+        state.seed_hover_last_client = { x = mx, y = my }
+        return state.seed_hover_cache ~= nil
     end
 
     deps.capture_points_in_radius = function(mx, my, radius, env)
@@ -92,6 +141,11 @@ function M.new(state, config, modules)
         return ops.refresh_captured_from_envelope(state, env, ai)
     end
 
+    deps.sync_brush_point_selection = function(env, captured_points)
+        local ai = state.envelope_autoitem_idx or -1
+        return ops.sync_envelope_selection_to_captured(env, ai, captured_points)
+    end
+
     deps.calc_inner_brush_radius = function(outer_radius)
         return core.calc_inner_brush_radius(state, config, outer_radius)
     end
@@ -111,19 +165,25 @@ function M.new(state, config, modules)
         return core.arrange_client_to_imgui(state.ctx, core.get_arrange_hwnd, x, y)
     end
 
-    deps.for_each_envelope_point = ops.for_each_envelope_point
-
-    local function run_min_spacing_after_drag_if_needed()
-        if state.target_envelope then
-            ops.enforce_min_screen_spacing(state, state.target_envelope, state.envelope_autoitem_idx or -1, deps.envelope_to_screen, core.get_distance, nil)
+    --- Nearly-collinear interior points (screen angle). Smooth + LMB release only; see input.end_drag_operation.
+    local function run_smooth_angle_cleanup_on_lmb_up()
+        if state.active_sculpt_kind ~= "smooth" or not state.target_envelope then
+            return
         end
+        ops.remove_redundant_envelope_points_by_angle(
+            config,
+            state.target_envelope,
+            state.envelope_autoitem_idx or -1,
+            deps.envelope_to_screen,
+            nil
+        )
     end
-    deps.run_min_spacing_after_drag_if_needed = run_min_spacing_after_drag_if_needed
+    deps.run_smooth_angle_cleanup_on_lmb_up = run_smooth_angle_cleanup_on_lmb_up
 
     deps.end_drag_operation = function()
         return input.end_drag_operation(state, {
             sort_envelope_points_for_autoitem = ops.sort_envelope_points_for_autoitem,
-            enforce_min_spacing_after_drag = run_min_spacing_after_drag_if_needed,
+            cleanup_redundant_points_after_drag = run_smooth_angle_cleanup_on_lmb_up,
         })
     end
 

@@ -1,9 +1,9 @@
 local SCRIPT_PATH = debug.getinfo(1, "S").source:match("^@(.+)$") or ""
 local SCRIPT_DIR = SCRIPT_PATH:match("^(.*[\\/])") or ""
 
-local CONFIG = dofile(SCRIPT_DIR .. "BrushConfig.lua")
-local EnvApi = dofile(SCRIPT_DIR .. "BrushEnvelopeApi.lua")
-local ArrangeMsg = dofile(SCRIPT_DIR .. "BrushArrangeMessages.lua")
+local CONFIG = dofile(SCRIPT_DIR .. "config.lua")
+local EnvApi = dofile(SCRIPT_DIR .. "envelope/envelope_api.lua")
+local ArrangeMsg = dofile(SCRIPT_DIR .. "arrange_messages.lua")
 
 local M = {}
 M.CONFIG = CONFIG
@@ -20,10 +20,9 @@ function M.new_state(config)
         invert_brush_size_scroll = b.DEFAULT_INVERT_BRUSH_SIZE_SCROLL,
         falloff_type = 1,
         falloff_strength = f.DEFAULT_FALLOFF_STRENGTH,
-        --- Set on LMB down: "nudge" | "sculpt" | "smooth" (see BrushInput.resolve_brush_drag_kind).
+        --- Set on LMB down: "nudge" | "sculpt" | "smooth" (see input.resolve_brush_drag_kind).
         active_sculpt_kind = nil,
         sculpt_power = s.DEFAULT_SCULPT_POWER,
-        enable_continuous_smoothing = s.DEFAULT_ENABLE_CONTINUOUS_SMOOTHING,
         min_point_spacing_px = config.spacing.DEFAULT_MIN_POINT_SPACING_PX,
         lock_time_axis = false,
         lock_value_axis = false,
@@ -52,7 +51,13 @@ function M.new_state(config)
         sws_hover_detected = false,
 
         -- Cached envelope properties
-        cached_envelope_properties = {envelope = nil, min_val = 0, max_val = 1},
+        cached_envelope_properties = {
+            envelope = nil,
+            min_val = 0,
+            max_val = 1,
+            center_val = 0.5,
+            scaling_mode = 0,
+        },
 
         -- Per-frame cache (arrange view)
         frame_arrange_start = 0,
@@ -70,17 +75,24 @@ function M.new_state(config)
         undo_operation_name = "",
         sculpt_sort_pending = false,
         sculpt_last_client = nil,
-        --- reaper.time_precise() when Envelope_SortPoints* last ran during sculpt (nil = sort ASAP on next tick).
+        --- reaper.time_precise() when Envelope_SortPoints* last ran during sculpt. Set at LMB so the first move does not
+        --- immediately sort (same frame as first SetEnvelopePoint* was causing a large hitch on dense envelopes).
         last_envelope_sort_os = nil,
         --- Set when sculpt moved points; cleared when throttled sort runs (avoids sorting every 250ms while idle).
         envelope_points_dirty_sort = false,
 
         -- ImGui: editor window + brush HUD (same context).
         ctx = nil,
+        --- Lock axis chips + overlay: `Lock Closed.ttf` / `Lock Open.ttf` next to script (glyph U+0041).
+        font_lock_closed = nil,
+        font_lock_open = nil,
 
         -- Default point shape from chunk; invalidated with target envelope (see clear_target_envelope_state_only).
         cached_defshape_envelope = nil,
         cached_defshape_value = 0,
+
+        --- True after `on_script_close` (Escape / toggle / atexit) so cleanup runs once.
+        _shutdown_complete = false,
 
         -- Arrange: JS_WindowMessage_Intercept/Peek (wheel + LMB + optional MOVE while eating LMB).
         arrange_intercept_active = false,
@@ -89,6 +101,9 @@ function M.new_state(config)
         wm_wheel_last_time = 0,
         wm_lmb_down_last_time = 0,
         wm_lmb_up_last_time = 0,
+        wm_rmb_down_last_time = 0,
+        wm_rmb_up_last_time = 0,
+        wm_contextmenu_last_time = 0,
         wm_mousemove_last_time = 0,
         brush_ate_arrange_lmb = false,
         arrange_move_intercept_active = false,
@@ -99,22 +114,25 @@ function M.new_state(config)
         --- Set by keyboard (Escape): main_loop forces exit like closing the editor window.
         script_close_requested = false,
 
-        -- Debug: release JS message intercepts, hide arrange HUD; test insert via button only.
-        debug_disable_js_eat = false,
-        _debug_js_eat_prev = false,
-        --- Arrange HUD: label each envelope point with its arrange-client (x,y) used by brush/hit logic.
-        debug_show_point_client_coords = false,
-
         -- Brush HUD text (next to cursor): alpha 0..1; updated in main_loop when envelope hover active.
         brush_hud_text_alpha = 1.0,
         _brush_hud_fade_last_os = nil,
-        _vk_tab_down_prev = false,
-        --- JS VK_ESCAPE edge tracking while brush settings mode is open (arrange has focus).
-        _brush_settings_esc_js_prev = false,
+        --- Escape edge while brush settings open (JS + ImGui; arrange keeps keyboard focus).
+        _brush_settings_esc_prev = nil,
+        _vk_prev_esc = nil,
+        _vk_prev_x = nil,
+        _vk_prev_y = nil,
 
         -- Wheel inertial coast for plain scroll (brush size) only.
         wheel_momentum_vel = 0,
         wheel_mom_size_accum = 0,
+
+        -- Prepare-once cache for insert path (track select + BR_Env arm/commit).
+        prepared_insert_envelope = nil,
+
+        -- Hover-time seed warm cache: prebuilt point-distance list reused on first sculpt click.
+        seed_hover_cache = nil,
+        seed_hover_last_client = nil,
 
     }
 end
@@ -127,7 +145,9 @@ function M.clamp(value, min_val, max_val)
     return math.max(min_val, math.min(max_val, value))
 end
 
---- While sculpt_sort_pending: sort at most every ENVELOPE_SORT_INTERVAL_SEC. nil last_envelope_sort_os => sort on next call.
+--- While sculpt_sort_pending: sort at most every ENVELOPE_SORT_INTERVAL_SEC.
+--- If last_envelope_sort_os is nil (e.g. after target reset), sort on the next due call. LMB sets it to "now" so the
+--- first sculpt tick does not also pay for a full Envelope_SortPoints (see input.on_lmb_pressed).
 function M.tick_throttled_envelope_sort_if_due(state, config, ops)
     if not state.sculpt_sort_pending or not state.target_envelope or not state.envelope_points_dirty_sort then
         return false
@@ -171,49 +191,46 @@ function M.get_arrange_hwnd()
     return reaper.JS_Window_FindChildByID(main, 0x3E8)
 end
 
---- Arrange HWND **client** mouse position, in the same ImGui/native space as the brush HUD
---- (GetRect + PointConvertNative → proportional map into GetClientRect). Not ScreenToClient(GetMouse).
-function M.get_mouse_client_xy(ctx, get_arrange_hwnd_fn)
-    if not ctx or not get_arrange_hwnd_fn or not reaper.GetMousePosition then return nil, nil end
-    if not reaper.ImGui_PointConvertNative or not reaper.JS_Window_GetClientRect then return nil, nil end
-    local mx, my = reaper.GetMousePosition()
-    local imx, imy = reaper.ImGui_PointConvertNative(ctx, mx, my, false)
-    if imx == nil or imy == nil then return nil, nil end
-    local il, it, iw, ih = M.get_arrange_imgui_overlay_geometry(ctx, get_arrange_hwnd_fn)
-    if not il or not it or not iw or not ih or iw <= 0 or ih <= 0 then return nil, nil end
-    local hwnd = get_arrange_hwnd_fn()
-    if not hwnd then return nil, nil end
-    local ok, l, t, r, b = reaper.JS_Window_GetClientRect(hwnd)
-    if not ok then return nil, nil end
-    local nl, nr = math.min(l, r), math.max(l, r)
-    local nt, nb = math.min(t, b), math.max(t, b)
-    local cw, ch = nr - nl, nb - nt
-    if cw <= 0 or ch <= 0 then return nil, nil end
-    local u = (imx - il) / iw
-    local v = (imy - it) / ih
-    u = M.clamp(u, 0, 1)
-    v = M.clamp(v, 0, 1)
-    return nl + u * cw, nt + v * ch
+--- True when the OS foreground window is REAPER main or a descendant (hide TopMost HUD when alt-tabbed away).
+function M.is_reaper_foreground()
+    local fg = reaper.JS_Window_GetForeground()
+    if not fg then
+        return false
+    end
+    local main = reaper.GetMainHwnd()
+    if not main then
+        return false
+    end
+    local hwnd = fg
+    while hwnd do
+        if hwnd == main then
+            return true
+        end
+        hwnd = reaper.JS_Window_GetParent(hwnd)
+    end
+    return false
 end
 
---- Inverse of get_mouse_client_xy: arrange client (same space as envelope_to_screen) -> ImGui overlay draw-list coords.
-function M.arrange_client_to_imgui(ctx, get_arrange_hwnd_fn, client_x, client_y)
-    if not ctx or not get_arrange_hwnd_fn or client_x == nil or client_y == nil then return nil, nil end
-    local il, it, iw, ih = M.get_arrange_imgui_overlay_geometry(ctx, get_arrange_hwnd_fn)
-    if not il or not it or not iw or not ih or iw <= 0 or ih <= 0 then return nil, nil end
+--- Arrange HWND client mouse (JS_Window_ScreenToClient). Same space as envelope_to_screen / I_TCP* lane math.
+function M.get_mouse_client_xy(_ctx, get_arrange_hwnd_fn)
+    if not get_arrange_hwnd_fn or not reaper.GetMousePosition or not reaper.JS_Window_ScreenToClient then
+        return nil, nil
+    end
     local hwnd = get_arrange_hwnd_fn()
     if not hwnd then return nil, nil end
-    local ok, l, t, r, b = reaper.JS_Window_GetClientRect(hwnd)
-    if not ok then return nil, nil end
-    local nl, nr = math.min(l, r), math.max(l, r)
-    local nt, nb = math.min(t, b), math.max(t, b)
-    local cw, ch = nr - nl, nb - nt
-    if cw <= 0 or ch <= 0 then return nil, nil end
-    local u = (client_x - nl) / cw
-    local v = (client_y - nt) / ch
-    u = M.clamp(u, 0, 1)
-    v = M.clamp(v, 0, 1)
-    return il + u * iw, it + v * ih
+    local sx, sy = reaper.GetMousePosition()
+    return reaper.JS_Window_ScreenToClient(hwnd, sx, sy)
+end
+
+--- Arrange client -> ImGui overlay draw-list (ClientToScreen + PointConvertNative). Inverse of get_mouse_client_xy.
+function M.arrange_client_to_imgui(ctx, get_arrange_hwnd_fn, client_x, client_y)
+    if not ctx or not get_arrange_hwnd_fn or client_x == nil or client_y == nil then return nil, nil end
+    if not reaper.JS_Window_ClientToScreen or not reaper.ImGui_PointConvertNative then return nil, nil end
+    local hwnd = get_arrange_hwnd_fn()
+    if not hwnd then return nil, nil end
+    local sx, sy = reaper.JS_Window_ClientToScreen(hwnd, client_x, client_y)
+    if sx == nil or sy == nil then return nil, nil end
+    return reaper.ImGui_PointConvertNative(ctx, sx, sy, false)
 end
 
 --- TK/Sexan: native arrange HWND rect -> ImGui coordinates (HiDPI / macOS safe).
@@ -257,7 +274,7 @@ function M.ensure_arrange_intercepts(state)
 end
 
 function M.release_arrange_intercepts(state)
-    return ArrangeMsg.release_arrange_intercepts(state)
+    return ArrangeMsg.release_arrange_intercepts(state, M.get_arrange_hwnd)
 end
 
 function M.process_arrange_lmb_or_forward(state, eat_lmb, eat_rmb)

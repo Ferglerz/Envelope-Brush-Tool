@@ -39,7 +39,6 @@ function M.serialize_snapshot(state)
         tostring(state.min_point_spacing_px or 1),
         state.lock_time_axis and "1" or "0",
         state.lock_value_axis and "1" or "0",
-        state.enable_continuous_smoothing and "1" or "0",
     }, "\1")
 end
 
@@ -89,7 +88,6 @@ function M.load_into_state(state, config)
     if state.lock_time_axis and state.lock_value_axis then
         state.lock_value_axis = false
     end
-    state.enable_continuous_smoothing = tb("enable_continuous_smoothing", state.enable_continuous_smoothing)
 end
 
 function M.write_from_state(state, config)
@@ -103,7 +101,6 @@ function M.write_from_state(state, config)
     set_ext("min_point_spacing_px", state.min_point_spacing_px)
     set_ext("lock_time", state.lock_time_axis and "1" or "0")
     set_ext("lock_value", state.lock_value_axis and "1" or "0")
-    set_ext("enable_continuous_smoothing", state.enable_continuous_smoothing and "1" or "0")
     if reaper.MarkProjectDirty then
         pcall(reaper.MarkProjectDirty)
     end

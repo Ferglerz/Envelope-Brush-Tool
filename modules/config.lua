@@ -1,4 +1,4 @@
--- Shared defaults for BrushCore.new_state and UI.
+-- Shared defaults for core.new_state and UI.
 
 return {
     --- Arrange view, SWS hover, and defer/insert integration
@@ -47,11 +47,16 @@ return {
         FALLOFF_INNER_RATIO_AT_MAX_STRENGTH = 0.12, -- ...at max strength
     },
 
-    --- Min spacing between points (screen px) after seed / on drag end
+    --- Min screen gap when seeding new envelope points (not used for deletion).
     spacing = {
         DEFAULT_MIN_POINT_SPACING_PX = 10,
         MIN_MIN_POINT_SPACING_PX = 1,
         MAX_MIN_POINT_SPACING_PX = 48,
+    },
+
+    --- After Shift+smooth drag (LMB up): drop interior points nearly collinear in arrange screen space.
+    cleanup = {
+        REDUNDANT_POINT_MIN_ANGLE_DEG = 175,
     },
 
     --- LMB drag mode labels (nudge / sculpt / smooth)
@@ -64,9 +69,8 @@ return {
     sculpt = {
         SCULPT_DRAG_MIN_MOVEMENT_PX = 0.02, -- Mouse move threshold per tick to apply sculpt
         ENVELOPE_SORT_INTERVAL_SEC = 0.25, -- Interval to sort points while sculpting
-        SMOOTH_SETTLE_BASE_PER_MOVE = 0.2, -- Shift smooth: Laplacian value step × falloff × (power / MAX); time still evens across brush
-        --- When true, Shift+smooth re-scans envelope points under the brush on each sculpt step (same threshold as sculpt drag).
-        DEFAULT_ENABLE_CONTINUOUS_SMOOTHING = false,
+        -- Smooth: blend per move = strength01 × brush falloff × this (cap 1). strength01 = (Power−MIN)/(MAX−MIN).
+        SMOOTH_MAX_BLEND_PER_MOVE = 0.5,
         DEFAULT_SCULPT_POWER = 1.0,
         MIN_SCULPT_POWER = 0.25,
         MAX_SCULPT_POWER = 4.0,
@@ -92,5 +96,15 @@ return {
         WHEEL_MOMENTUM_MAX_VEL = 48,
         WHEEL_MOMENTUM_STOP = 0.045,
         WHEEL_MOMENTUM_SIZE_RATE = 0.28,
+    },
+
+    -- Warmup for brush-width seed: build min-distance point list while hovering, reuse on click.
+    seed = {
+        HOVER_WARM_ENABLED = true,
+        HOVER_WARM_INTERVAL_SEC = 0.05,
+        HOVER_WARM_MIN_MOUSE_MOVE_PX = 2,
+        HOVER_WARM_PRECOMPUTE_INSERT_CANDIDATES = true,
+        SEED_CACHE_REUSE_CENTER_TOLERANCE_PX = 3,
+        SEED_CACHE_MAX_AGE_SEC = 0.25,
     },
 }

@@ -2,6 +2,25 @@
 
 local M = {}
 
+local ARRANGE_INTERCEPT_MSGS = {
+    "WM_MOUSEWHEEL",
+    "WM_LBUTTONDOWN",
+    "WM_LBUTTONUP",
+    "WM_RBUTTONDOWN",
+    "WM_RBUTTONUP",
+    "WM_CONTEXTMENU",
+}
+
+local function suppress_arrange_context_menu(state)
+    if state.brush_settings_mode or state.brush_ate_arrange_rmb then
+        return true
+    end
+    if state.target_envelope and state.sws_hover_detected then
+        return true
+    end
+    return false
+end
+
 local function wparam_wheel_delta_hiword(wph)
     if wph == nil or wph == 0 then return 0 end
     if math.abs(wph) <= 2000 then
@@ -31,6 +50,18 @@ local function release_one_message(hwnd, msg)
     if reaper.JS_WindowMessage_Release then
         pcall(reaper.JS_WindowMessage_Release, hwnd, msg)
     end
+    if reaper.JS_WindowMessage_PassThrough then
+        pcall(reaper.JS_WindowMessage_PassThrough, hwnd, msg, false)
+    end
+end
+
+--- Unhook wheel / buttons / move on a concrete HWND (safe to call even if this script never intercepted).
+local function release_all_known_messages_on_hwnd(hwnd)
+    if not hwnd then return end
+    for i = 1, #ARRANGE_INTERCEPT_MSGS do
+        release_one_message(hwnd, ARRANGE_INTERCEPT_MSGS[i])
+    end
+    release_one_message(hwnd, "WM_MOUSEMOVE")
 end
 
 local function ensure_arrange_move_intercept(state)
@@ -46,21 +77,57 @@ local function release_arrange_move_intercept(state)
     if not state.arrange_move_intercept_active then return end
     state.arrange_move_intercept_active = false
     state.wm_mousemove_last_time = 0
-    release_one_message(state.arrange_intercept_hwnd, "WM_MOUSEMOVE")
+    local hwnd = state.arrange_intercept_hwnd
+    if hwnd then
+        release_one_message(hwnd, "WM_MOUSEMOVE")
+    end
+end
+
+--- Drop queued intercept messages (peek + consume timestamp, no forward).
+local function discard_intercept_queue(state, hwnd, msg, last_key, max_iter)
+    if not hwnd or not reaper.JS_WindowMessage_Peek or not msg or not last_key then return end
+    max_iter = max_iter or 128
+    for _ = 1, max_iter do
+        local ret, _, time = reaper.JS_WindowMessage_Peek(hwnd, msg)
+        if not ret or not time or time == 0 then
+            break
+        end
+        if time == state[last_key] then
+            break
+        end
+        state[last_key] = time
+    end
+end
+
+--- Forward any messages still sitting in the intercept queue (blocked until Peek) so nothing is lost before Release.
+local function drain_intercept_queue(state, hwnd, msg, last_key, max_iter)
+    if not hwnd or not reaper.JS_WindowMessage_Peek or not msg or not last_key then return end
+    max_iter = max_iter or 128
+    for _ = 1, max_iter do
+        local ret, _, time, wpl, wph, lpl, lph = reaper.JS_WindowMessage_Peek(hwnd, msg)
+        if not ret or not time or time == 0 then
+            break
+        end
+        if time == state[last_key] then
+            break
+        end
+        state[last_key] = time
+        forward_wm(hwnd, msg, wpl, wph, lpl, lph)
+    end
 end
 
 --- WM_MOUSEWHEEL + WM_LBUTTON* on arrange (blocked until Peek + forward or drop). MOVE added while LMB is eaten.
---- get_arrange_hwnd: function() -> hwnd (e.g. BrushCore.get_arrange_hwnd)
+--- get_arrange_hwnd: function() -> hwnd (e.g. core.get_arrange_hwnd)
 function M.ensure_arrange_intercepts(state, get_arrange_hwnd)
     if state.arrange_intercept_active then return true end
     if not reaper.JS_WindowMessage_Intercept or not reaper.JS_WindowMessage_Peek then return false end
     local hwnd = get_arrange_hwnd and get_arrange_hwnd() or nil
     if not hwnd then return false end
-    local msgs = { "WM_MOUSEWHEEL", "WM_LBUTTONDOWN", "WM_LBUTTONUP", "WM_RBUTTONDOWN", "WM_RBUTTONUP" }
-    for i = 1, #msgs do
-        if not pcall(reaper.JS_WindowMessage_Intercept, hwnd, msgs[i], false) then
+    for i = 1, #ARRANGE_INTERCEPT_MSGS do
+        local msg = ARRANGE_INTERCEPT_MSGS[i]
+        if not pcall(reaper.JS_WindowMessage_Intercept, hwnd, msg, false) then
             for j = 1, i - 1 do
-                release_one_message(hwnd, msgs[j])
+                release_one_message(hwnd, ARRANGE_INTERCEPT_MSGS[j])
             end
             return false
         end
@@ -70,26 +137,56 @@ function M.ensure_arrange_intercepts(state, get_arrange_hwnd)
     return true
 end
 
-function M.release_arrange_intercepts(state)
-    if not state.arrange_intercept_active then return end
-    release_arrange_move_intercept(state)
-    local hwnd = state.arrange_intercept_hwnd
-    state.arrange_intercept_hwnd = nil
-    state.arrange_intercept_active = false
-    state.wm_wheel_last_time = 0
-    state.wm_lmb_down_last_time = 0
-    state.wm_lmb_up_last_time = 0
-    state.wm_rmb_down_last_time = 0
-    state.wm_rmb_up_last_time = 0
-    state.wm_mousemove_last_time = 0
-    state.brush_ate_arrange_lmb = false
-    state.brush_ate_arrange_rmb = false
-    if hwnd then
-        release_one_message(hwnd, "WM_MOUSEWHEEL")
-        release_one_message(hwnd, "WM_LBUTTONDOWN")
-        release_one_message(hwnd, "WM_LBUTTONUP")
-        release_one_message(hwnd, "WM_RBUTTONDOWN")
-        release_one_message(hwnd, "WM_RBUTTONUP")
+--- get_arrange_hwnd: optional; when set, always unhooks the *current* arrange HWND after state-based cleanup
+--- (covers atexit / second-run toggle if state and HWND diverged, or intercept_active was cleared incorrectly).
+function M.release_arrange_intercepts(state, get_arrange_hwnd)
+    if state.arrange_intercept_active then
+        local hwnd = state.arrange_intercept_hwnd
+        if not hwnd then
+            state.arrange_intercept_active = false
+            state.brush_ate_arrange_lmb = false
+            state.brush_ate_arrange_rmb = false
+            state.arrange_move_intercept_active = false
+        else
+            state.brush_ate_arrange_lmb = false
+            state.brush_ate_arrange_rmb = false
+
+            state.wm_mousemove_last_time = 0
+            if state.arrange_move_intercept_active then
+                drain_intercept_queue(state, hwnd, "WM_MOUSEMOVE", "wm_mousemove_last_time")
+            end
+            release_arrange_move_intercept(state)
+
+            state.wm_wheel_last_time = 0
+            state.wm_lmb_down_last_time = 0
+            state.wm_lmb_up_last_time = 0
+            state.wm_rmb_down_last_time = 0
+            state.wm_rmb_up_last_time = 0
+            state.wm_contextmenu_last_time = 0
+            drain_intercept_queue(state, hwnd, "WM_MOUSEWHEEL", "wm_wheel_last_time")
+            drain_intercept_queue(state, hwnd, "WM_LBUTTONDOWN", "wm_lmb_down_last_time")
+            drain_intercept_queue(state, hwnd, "WM_LBUTTONUP", "wm_lmb_up_last_time")
+            discard_intercept_queue(state, hwnd, "WM_RBUTTONDOWN", "wm_rmb_down_last_time")
+            discard_intercept_queue(state, hwnd, "WM_RBUTTONUP", "wm_rmb_up_last_time")
+            discard_intercept_queue(state, hwnd, "WM_CONTEXTMENU", "wm_contextmenu_last_time")
+
+            state.arrange_intercept_hwnd = nil
+            state.arrange_intercept_active = false
+            state.wm_wheel_last_time = 0
+            state.wm_lmb_down_last_time = 0
+            state.wm_lmb_up_last_time = 0
+            state.wm_rmb_down_last_time = 0
+            state.wm_rmb_up_last_time = 0
+            state.wm_contextmenu_last_time = 0
+            state.wm_mousemove_last_time = 0
+
+            release_all_known_messages_on_hwnd(hwnd)
+        end
+    end
+
+    local live = get_arrange_hwnd and get_arrange_hwnd() or nil
+    if live then
+        release_all_known_messages_on_hwnd(live)
     end
 end
 
@@ -152,6 +249,14 @@ function M.process_arrange_lmb_or_forward(state, eat_lmb, get_arrange_hwnd, eat_
 
     handle_rmb("WM_RBUTTONDOWN", "wm_rmb_down_last_time")
     handle_rmb("WM_RBUTTONUP", "wm_rmb_up_last_time")
+
+    local ret_cm, _, time_cm, wpl_cm, wph_cm, lpl_cm, lph_cm = reaper.JS_WindowMessage_Peek(hwnd, "WM_CONTEXTMENU")
+    if ret_cm and time_cm and time_cm ~= 0 and time_cm ~= state.wm_contextmenu_last_time then
+        state.wm_contextmenu_last_time = time_cm
+        if not suppress_arrange_context_menu(state) then
+            forward_wm(hwnd, "WM_CONTEXTMENU", wpl_cm, wph_cm, lpl_cm, lph_cm)
+        end
+    end
 
     if state.arrange_move_intercept_active then
         while true do
