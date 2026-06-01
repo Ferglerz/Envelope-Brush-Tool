@@ -4,6 +4,8 @@ local _mod_dir = (((debug.getinfo(1, "S").source or ""):match("^@(.+)$")) or "")
 local Path = dofile(_mod_dir .. "path.lua")
 local Util = Path.load_from_modules("util.lua")
 local Mods = Path.load_from_modules("mods.lua")
+local ActionShortcuts = Path.load_from_modules("action_shortcuts.lua")
+local EnvApi = Path.load_from_modules("envelope/envelope_api.lua")
 
 local function imgui_mouse_wheel_sum(state)
     local w = 0
@@ -69,26 +71,22 @@ local function wheel_mod_power_cmd_ctrl(arrange_wparam_lo)
     return js
 end
 
---- Same priority as handle_wheel: Alt → falloff, Cmd/Ctrl → power, else size.
+--- Same priority as handle_wheel: Shift → density, Alt → falloff, Cmd/Ctrl → power, else size.
 local function wheel_adjust_kind(arrange_wparam_lo)
+    if wheel_mod_shift(arrange_wparam_lo) then return "density" end
     if wheel_mod_alt() then return "falloff" end
     if wheel_mod_power_cmd_ctrl(arrange_wparam_lo) then return "power" end
     return "size"
 end
 
 function M.brush_wheel_context_active(state)
-    if state.sws_hover_detected and state.target_envelope then return true end
+    if Util.brush_tool_active(state) then return true end
     if state.ctx and reaper.ImGui_IsWindowHovered then
         local hf = reaper.ImGui_HoveredFlags_AnyWindow
         local flag = hf and (type(hf) == "function" and hf() or hf) or 0
         local ok, h = pcall(reaper.ImGui_IsWindowHovered, state.ctx, flag)
         if ok and h then return true end
     end
-    return false
-end
-
-local function imgui_key_pressed_any(state, key)
-    if state.ctx and reaper.ImGui_IsKeyPressed(state.ctx, key) then return true end
     return false
 end
 
@@ -112,13 +110,6 @@ local function js_vkey_pressed_edge(state, vk, prev_field)
     return down and not prev
 end
 
-local function key_pressed_edge(state, vk, prev_field, imgui_key_fn)
-    if imgui_key_fn and imgui_key_pressed_any(state, imgui_key_fn()) then
-        return true
-    end
-    return js_vkey_pressed_edge(state, vk, prev_field)
-end
-
 local function toggle_lock_time_axis(state)
     state.lock_time_axis = not state.lock_time_axis
     if state.lock_time_axis then
@@ -133,24 +124,66 @@ local function toggle_lock_value_axis(state)
     end
 end
 
-local function begin_undo_once(state, name)
-    if not state.undo_active then
-        reaper.Undo_BeginBlock()
-        state.undo_active = true
-        state.undo_operation_name = name
+local function brush_undo_operation_name(state, config, kind)
+    local labels = config and config.drag and config.drag.BRUSH_DRAG_KIND_LABELS
+    local kind_label = (labels and labels[kind]) or kind or "Edit"
+    local location = EnvApi.brush_target_location_label(
+        state,
+        state.target_envelope,
+        Util.track_autoitem_idx(state)
+    )
+    return string.format("Brush %s: %s", kind_label, location)
+end
+
+--- Label + dirty flag for one undo point at stroke end (Undo_OnStateChangeEx2).
+local function mark_stroke_undo_pending(state, config, kind)
+    if not state.pending_undo_label then
+        state.pending_undo_label = brush_undo_operation_name(state, config, kind)
     end
+end
+
+local function mark_stroke_undo_dirty(state)
+    state.envelope_stroke_dirty = true
+end
+
+local function stroke_time_key(t)
+    return math.floor(t * 1e9 + 0.5)
+end
+
+local function note_smooth_stroke_capture(state, captured_points)
+    if not captured_points or #captured_points == 0 then
+        return
+    end
+    if not state.smooth_stroke_point_times then
+        state.smooth_stroke_point_times = {}
+    end
+    local map = state.smooth_stroke_point_times
+    for i = 1, #captured_points do
+        local t = captured_points[i].original_time
+        if type(t) == "number" and t == t then
+            map[stroke_time_key(t)] = t
+        end
+    end
+end
+
+local function clear_stroke_undo_state(state)
+    state.pending_undo_label = nil
+    state.envelope_stroke_dirty = false
 end
 
 local function clear_drag_pointer_state(state)
     state.envelope_flush_pending = false
     state.is_dragging = false
+    state.brush_stroke_committed = false
+    state.brush_lmb_press_armed = false
     state.captured_points = {}
+    state.smooth_stroke_point_times = nil
     state.last_create_client = nil
     state.sculpt_last_client = nil
     state.active_sculpt_kind = nil
 end
 
---- Shared: pending Envelope_SortPoints* after sculpt + Undo_EndBlock when a block was opened.
+--- Pending Envelope_SortPoints* after sculpt + one Undo_OnStateChangeEx2 per completed stroke.
 --- opts.sort_envelope_points_for_autoitem: required for sort when sculpt_sort_pending.
 function M.apply_envelope_undo_finalize(state, opts)
     if state.sculpt_sort_pending and state.target_envelope then
@@ -167,14 +200,17 @@ function M.apply_envelope_undo_finalize(state, opts)
         state.envelope_points_dirty_sort = false
     end
 
-    if state.undo_active then
-        reaper.Undo_EndBlock(state.undo_operation_name, -1)
-        state.undo_active = false
-        state.undo_operation_name = ""
+    if state.envelope_stroke_dirty and state.pending_undo_label then
+        local label = state.pending_undo_label
+        if opts and opts.config and state.active_sculpt_kind and state.target_envelope then
+            label = brush_undo_operation_name(state, opts.config, state.active_sculpt_kind)
+        end
+        reaper.Undo_OnStateChangeEx2(0, label, -1, -1)
     end
+    clear_stroke_undo_state(state)
 end
 
---- LMB release: optional opts.cleanup_redundant_points_after_drag (smooth-only angle cleanup in deps).
+--- LMB release: optional opts.cleanup_redundant_points_after_drag (smooth bezier → angle → bezier in deps).
 function M.end_drag_operation(state, opts)
     if not state.is_dragging then
         return
@@ -182,13 +218,16 @@ function M.end_drag_operation(state, opts)
     if opts and opts.cleanup_redundant_points_after_drag then
         opts.cleanup_redundant_points_after_drag()
     end
-    clear_drag_pointer_state(state)
     M.apply_envelope_undo_finalize(state, opts)
+    clear_drag_pointer_state(state)
 end
 
---- Script exit: same undo/sort rules as end_drag_operation, but also runs when not dragging (orphaned undo block).
+--- Script exit: finalize any stroke undo state left open.
 function M.end_session_from_script_close(state, opts)
     if state.is_dragging then
+        if opts and opts.cleanup_redundant_points_after_drag then
+            opts.cleanup_redundant_points_after_drag()
+        end
         clear_drag_pointer_state(state)
     end
     M.apply_envelope_undo_finalize(state, opts)
@@ -252,7 +291,7 @@ function M.tick_wheel_momentum(state, config, clamp)
     end
 end
 
---- Scroll: brush size | Alt+scroll: falloff | Cmd/Ctrl+scroll: power (Alt wins if both) | Shift: 25% finer steps.
+--- Scroll: size | Shift+scroll: min density | Alt+scroll: falloff | Cmd/Ctrl+scroll: power (Shift/Alt win over Ctrl).
 --- Arrange wheel: intercepted (blocked); eaten for brush when context active, else forwarded to arrange.
 function M.handle_wheel_input(state, config, clamp, core)
     if not state.ctx then return false end
@@ -267,31 +306,37 @@ function M.handle_wheel_input(state, config, clamp, core)
     local wheel_delta = (wm ~= 0) and wm or ig
     if wheel_delta == 0 then return false end
 
+    local shift = wheel_mod_shift(arrange_wparam_lo)
     local alt = wheel_mod_alt()
-    local fine = wheel_mod_shift(arrange_wparam_lo) and 0.25 or 1.0
     local d = wheel_delta > 0 and 1 or -1
-    --- Default scroll→size mapping is inverted vs raw wheel delta; optional checkbox restores the legacy direction.
-    local d_size = state.invert_brush_size_scroll and d or -d
+    --- Default scroll→size/falloff/density mapping is inverted vs raw wheel delta; optional setting restores the legacy direction.
+    local d_scroll = state.invert_scroll and d or -d
 
     local fcfg, scfg, bcfg, wcfg = config.falloff, config.sculpt, config.brush, config.wheel
-    if alt then
+    if shift then
         M.clear_wheel_momentum(state)
-        local step = core.falloff_wheel_step(config, fine)
+        local spcfg = config.spacing
+        local sp_min, sp_max = spcfg.MIN_MIN_POINT_SPACING_PX, spcfg.MAX_MIN_POINT_SPACING_PX
+        state.min_point_spacing_px = clamp(
+            state.min_point_spacing_px + d_scroll, sp_min, sp_max)
+    elseif alt then
+        M.clear_wheel_momentum(state)
+        local step = core.falloff_wheel_step(config, 1.0)
         state.falloff_strength = core.clamp_falloff_strength(
-            state.falloff_strength + d * step, config)
+            state.falloff_strength + d_scroll * step, config)
     elseif wheel_mod_power_cmd_ctrl(arrange_wparam_lo) then
         M.clear_wheel_momentum(state)
-        local step = core.sculpt_wheel_step(config, fine)
+        local step = core.sculpt_wheel_step(config, 1.0)
         state.sculpt_power = core.clamp_sculpt_power(state.sculpt_power + d * step, config)
     else
-        local step = math.max(1, math.floor(bcfg.BRUSH_SIZE_STEP * fine + 0.5))
-        state.brush_size = clamp(state.brush_size + d_size * step,
+        local step = math.max(1, math.floor(bcfg.BRUSH_SIZE_STEP + 0.5))
+        state.brush_size = clamp(state.brush_size + d_scroll * step,
             bcfg.MIN_BRUSH_SIZE, bcfg.MAX_BRUSH_SIZE)
         local imp = wcfg.WHEEL_MOMENTUM_IMPULSE or 2.5
         local mag = math.min(math.abs(wheel_delta), 4)
         local sign = wheel_delta > 0 and 1 or -1
-        local mul = state.invert_brush_size_scroll and 1 or -1
-        local add = sign * mag * imp * fine * mul
+        local mul = state.invert_scroll and 1 or -1
+        local add = sign * mag * imp * mul
         state.wheel_momentum_vel = math.max(-(wcfg.WHEEL_MOMENTUM_MAX_VEL or 32),
             math.min(wcfg.WHEEL_MOMENTUM_MAX_VEL or 32, (state.wheel_momentum_vel or 0) + add))
     end
@@ -355,6 +400,11 @@ end
 function M.handle_keyboard_input(state, deps)
     if not state.ctx then return false end
 
+    -- Undo/redo: defer+ImGui often blocks Main accelerators; honor the user's action bindings.
+    if ActionShortcuts.try_passthrough_main_shortcuts(state) then
+        return true
+    end
+
     -- Escape: JS edges only (arrange keeps focus). First Esc closes settings; second closes script.
     if state.brush_settings_mode then
         if js_vkey_pressed_edge(state, VK_ESCAPE, "_brush_settings_esc_prev") then
@@ -368,12 +418,13 @@ function M.handle_keyboard_input(state, deps)
         return true
     end
 
+    -- X/Y lock: JS edges only (same as Escape; ImGui IsKeyPressed skipped prev sync → double toggle while held).
     if state.target_envelope then
-        if key_pressed_edge(state, VK_X, "_vk_prev_x", reaper.ImGui_Key_X) then
+        if js_vkey_pressed_edge(state, VK_X, "_vk_prev_x") then
             toggle_lock_time_axis(state)
             return true
         end
-        if key_pressed_edge(state, VK_Y, "_vk_prev_y", reaper.ImGui_Key_Y) then
+        if js_vkey_pressed_edge(state, VK_Y, "_vk_prev_y") then
             toggle_lock_value_axis(state)
             return true
         end
@@ -422,7 +473,7 @@ local function sculpt_delta_below_threshold(dx, dy, config)
 end
 
 function M.try_apply_sculpt_drag(state, config, mx, my, deps)
-    if not state.target_envelope or state.drag_mode ~= "sculpt" then return end
+    if not Util.brush_tool_active(state) or state.drag_mode ~= "sculpt" then return end
 
     local kind = state.active_sculpt_kind or "nudge"
     local continuous_smooth = kind == "smooth"
@@ -451,8 +502,11 @@ function M.try_apply_sculpt_drag(state, config, mx, my, deps)
         state.sculpt_last_client = { x = mx, y = my }
         return
     end
-    local undo_name = (kind == "smooth") and "Brush Smooth Envelope" or "Brush Nudge Envelope"
-    begin_undo_once(state, undo_name)
+    if continuous_smooth then
+        note_smooth_stroke_capture(state, state.captured_points)
+    end
+    mark_stroke_undo_pending(state, config, kind)
+    mark_stroke_undo_dirty(state)
     deps.sculpt_captured_points(state.captured_points, dx, dy, state.target_envelope)
     deps.refresh_captured_from_envelope(state.target_envelope)
     state.sculpt_last_client = { x = mx, y = my }
@@ -461,7 +515,7 @@ end
 
 --- LMB drag (sculpt combined): capture at press only; falloff weights are from brush center at LMB, not current mouse.
 function M.try_combined_drag(state, config, mx, my, deps)
-    if not state.target_envelope or state.drag_mode ~= "combined" then return end
+    if not Util.brush_tool_active(state) or state.drag_mode ~= "combined" then return end
 
     if not state.sculpt_last_client then
         state.sculpt_last_client = { x = state.drag_start_pos.x, y = state.drag_start_pos.y }
@@ -474,7 +528,7 @@ function M.try_combined_drag(state, config, mx, my, deps)
     end
 
     if #state.captured_points > 0 then
-        begin_undo_once(state, "Brush Sculpt Envelope")
+        mark_stroke_undo_dirty(state)
         deps.sculpt_captured_points(state.captured_points, dx, dy, state.target_envelope)
         deps.refresh_captured_from_envelope(state.target_envelope)
         state.sculpt_sort_pending = true
@@ -483,8 +537,11 @@ function M.try_combined_drag(state, config, mx, my, deps)
 end
 
 function M.on_lmb_pressed(state, config, mx, my, deps)
-    if not state.target_envelope then return end
+    if not state.target_envelope or not state.brush_lmb_press_armed then
+        return
+    end
 
+    state.brush_stroke_committed = true
     state.is_dragging = true
     local kind = M.resolve_brush_drag_kind()
     state.active_sculpt_kind = kind
@@ -498,23 +555,29 @@ function M.on_lmb_pressed(state, config, mx, my, deps)
 
     if kind == "nudge" or kind == "smooth" then
         state.captured_points = deps.capture_points_in_radius(mx, my, state.brush_size, state.target_envelope)
-        if deps.sync_brush_point_selection then
+        if kind == "smooth" then
+            state.smooth_stroke_point_times = {}
+            note_smooth_stroke_capture(state, state.captured_points)
+        end
+        if kind == "nudge" and deps.sync_brush_point_selection then
             deps.sync_brush_point_selection(state.target_envelope, state.captured_points)
         end
+        -- Nudge/smooth: undo label on first movement; Undo_OnStateChangeEx2 on LMB up.
         return
     end
 
+    -- Sculpt: label at press; Undo_OnStateChangeEx2 on release if stroke changed anything.
+    mark_stroke_undo_pending(state, config, kind)
     local n = deps.seed_brush_width_at_client(mx, my)
-
     if n > 0 then
-        reaper.Undo_BeginBlock()
-        state.undo_active = true
-        state.undo_operation_name = "Brush Sculpt Envelope"
+        mark_stroke_undo_dirty(state)
     end
     state.captured_points = deps.capture_points_in_radius(mx, my, state.brush_size, state.target_envelope)
     if deps.sync_brush_point_selection then
         deps.sync_brush_point_selection(state.target_envelope, state.captured_points)
     end
 end
+
+M.note_smooth_stroke_capture = note_smooth_stroke_capture
 
 return M

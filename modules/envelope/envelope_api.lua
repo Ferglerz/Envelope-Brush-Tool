@@ -64,6 +64,29 @@ function M.envelope_is_take_envelope(envelope)
     return false
 end
 
+--- Cached for script lifetime per envelope pointer (invalidated on target clear / project switch).
+--- While the brush tool is open, automation items are not created on a lane without re-running the script context.
+function M.envelope_has_automation_items(envelope, state)
+    if not envelope or not state then
+        return false
+    end
+    if not reaper.CountAutomationItems then
+        return false
+    end
+    local cache = state.envelope_ai_lane_cache
+    if cache == nil then
+        cache = {}
+        state.envelope_ai_lane_cache = cache
+    end
+    local known = cache[envelope]
+    if known ~= nil then
+        return known
+    end
+    local has = reaper.CountAutomationItems(envelope) > 0
+    cache[envelope] = has
+    return has
+end
+
 --- Returns insert_time, evaluate_time for Envelope_Evaluate / InsertEnvelopePoint*.
 --- Track + automation item: project timeline for both. Take envelope (parent lane only): evaluate at project_time - item position; insert time multiplies by take playrate (ReaScript insert pattern).
 function M.envelope_insert_evaluate_times(envelope, project_time, autoitem_idx)
@@ -381,9 +404,85 @@ function M.prepare_envelope_for_point_insert(envelope)
     end
 end
 
+local function non_empty_string(s, fallback)
+    s = (tostring(s or ""):match("^%s*(.-)%s*$")) or ""
+    if s == "" then
+        return fallback
+    end
+    return s
+end
+
+--- Track name for undo labels (master → "Master", else P_NAME or "Track N").
+function M.track_display_name_for_envelope(envelope)
+    if not envelope or not reaper.GetEnvelopeInfo_Value then
+        return "Unknown track"
+    end
+    local tr = reaper.GetEnvelopeInfo_Value(envelope, "P_TRACK")
+    if not tr then
+        return "Unknown track"
+    end
+    local master = reaper.GetMasterTrack(0)
+    if master and tr == master then
+        return "Master"
+    end
+    if reaper.GetTrackName then
+        local ok, name = reaper.GetTrackName(tr)
+        if ok then
+            name = non_empty_string(name, nil)
+            if name then
+                return name
+            end
+        end
+    end
+    local num = reaper.GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER")
+    if type(num) == "number" and num > 0 then
+        return string.format("Track %d", math.floor(num))
+    end
+    return "Track"
+end
+
+--- Envelope lane label from GetEnvelopeName (Volume, Pan, FX param, …).
+function M.envelope_lane_display_name(envelope)
+    if not envelope or not reaper.GetEnvelopeName then
+        return "Envelope"
+    end
+    local ok, name = reaper.GetEnvelopeName(envelope)
+    if ok then
+        name = non_empty_string(name, nil)
+        if name then
+            return name
+        end
+    end
+    return "Envelope"
+end
+
+--- When ai_idx >= 0, suffix for automation-item lane (1-based index).
+function M.automation_item_lane_suffix(_envelope, autoitem_idx)
+    if type(autoitem_idx) ~= "number" or autoitem_idx < 0 then
+        return nil
+    end
+    return string.format("Automation item %d", autoitem_idx + 1)
+end
+
+--- "Track / Lane" or "Track / Lane / Automation item N" for Undo_EndBlock descriptions.
+function M.brush_target_location_label(_state, envelope, autoitem_idx)
+    local track = M.track_display_name_for_envelope(envelope)
+    local lane = M.envelope_lane_display_name(envelope)
+    local ai = M.automation_item_lane_suffix(envelope, autoitem_idx)
+    if ai then
+        return string.format("%s / %s / %s", track, lane, ai)
+    end
+    return string.format("%s / %s", track, lane)
+end
+
 function M.clear_target_envelope_state_only(state)
     state.target_envelope = nil
     state.envelope_autoitem_idx = -1
+    state.envelope_lane_hover = false
+    state.envelope_curve_hover = false
+    state.brush_stroke_committed = false
+    state.brush_lmb_press_armed = false
+    state.envelope_ai_lane_cache = nil
     state.cached_envelope_properties.envelope = nil
     state.cached_defshape_envelope = nil
     state.envelope_flush_pending = false

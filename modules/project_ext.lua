@@ -35,10 +35,15 @@ function M.serialize_snapshot(state)
         tostring(state.falloff_type or 1),
         string.format("%.8g", state.falloff_strength or 0),
         string.format("%.8g", state.sculpt_power or 0),
-        state.invert_brush_size_scroll and "1" or "0",
+        state.invert_scroll and "1" or "0",
         tostring(state.min_point_spacing_px or 1),
         state.lock_time_axis and "1" or "0",
         state.lock_value_axis and "1" or "0",
+        state.smooth_cleanup_bezier_enabled and "1" or "0",
+        state.smooth_cleanup_angle_enabled and "1" or "0",
+        string.format("%.8g", state.smooth_bezier_fit_tolerance or 0),
+        state.hud_hints_enabled and "1" or "0",
+        state.hud_info_enabled and "1" or "0",
     }, "\1")
 end
 
@@ -48,7 +53,7 @@ function M.load_into_state(state, config)
     local ver = get_ext("version")
     if ver == "" then return end
 
-    local fcfg, bcfg, spcfg, scfg = config.falloff, config.brush, config.spacing, config.sculpt
+    local fcfg, bcfg, spcfg, scfg, ccfg = config.falloff, config.brush, config.spacing, config.sculpt, config.cleanup
     local ntypes = #(fcfg.FALLOFF_TYPES or {})
 
     local function ti(key, default)
@@ -80,7 +85,7 @@ function M.load_into_state(state, config)
         scfg.MIN_SCULPT_POWER,
         math.min(scfg.MAX_SCULPT_POWER, ti("sculpt_power", state.sculpt_power))
     )
-    state.invert_brush_size_scroll = tb("invert_brush_size_scroll", state.invert_brush_size_scroll)
+    state.invert_scroll = tb("invert_scroll", state.invert_scroll)
     local sp = math.floor(ti("min_point_spacing_px", state.min_point_spacing_px) + 0.5)
     state.min_point_spacing_px = math.max(spcfg.MIN_MIN_POINT_SPACING_PX, math.min(spcfg.MAX_MIN_POINT_SPACING_PX, sp))
     state.lock_time_axis = tb("lock_time", state.lock_time_axis)
@@ -88,6 +93,16 @@ function M.load_into_state(state, config)
     if state.lock_time_axis and state.lock_value_axis then
         state.lock_value_axis = false
     end
+    state.smooth_cleanup_bezier_enabled = tb("smooth_cleanup_bezier", state.smooth_cleanup_bezier_enabled)
+    state.smooth_cleanup_angle_enabled = tb("smooth_cleanup_angle", state.smooth_cleanup_angle_enabled)
+    local tol_min = ccfg.BEZIER_FIT_TOLERANCE_MIN or 0.001
+    local tol_max = ccfg.BEZIER_FIT_TOLERANCE_MAX or 0.05
+    state.smooth_bezier_fit_tolerance = math.max(
+        tol_min,
+        math.min(tol_max, ti("smooth_bezier_fit_tolerance", state.smooth_bezier_fit_tolerance))
+    )
+    state.hud_hints_enabled = tb("hud_hints", state.hud_hints_enabled)
+    state.hud_info_enabled = tb("hud_info", state.hud_info_enabled)
 end
 
 function M.write_from_state(state, config)
@@ -97,10 +112,15 @@ function M.write_from_state(state, config)
     set_ext("falloff_type", state.falloff_type)
     set_ext("falloff_strength", string.format("%.10g", state.falloff_strength))
     set_ext("sculpt_power", string.format("%.10g", state.sculpt_power))
-    set_ext("invert_brush_size_scroll", state.invert_brush_size_scroll and "1" or "0")
+    set_ext("invert_scroll", state.invert_scroll and "1" or "0")
     set_ext("min_point_spacing_px", state.min_point_spacing_px)
     set_ext("lock_time", state.lock_time_axis and "1" or "0")
     set_ext("lock_value", state.lock_value_axis and "1" or "0")
+    set_ext("smooth_cleanup_bezier", state.smooth_cleanup_bezier_enabled and "1" or "0")
+    set_ext("smooth_cleanup_angle", state.smooth_cleanup_angle_enabled and "1" or "0")
+    set_ext("smooth_bezier_fit_tolerance", string.format("%.10g", state.smooth_bezier_fit_tolerance))
+    set_ext("hud_hints", state.hud_hints_enabled and "1" or "0")
+    set_ext("hud_info", state.hud_info_enabled and "1" or "0")
     if reaper.MarkProjectDirty then
         pcall(reaper.MarkProjectDirty)
     end

@@ -161,8 +161,12 @@ function M.new(state, config, modules)
 
     deps.primary_modifier_short_name = core.primary_modifier_short_name
 
+    deps.brush_drag_kind_key = function()
+        return (state.is_dragging and state.active_sculpt_kind) or input.resolve_brush_drag_kind()
+    end
+
     deps.brush_drag_kind_display = function()
-        local k = (state.is_dragging and state.active_sculpt_kind) or input.resolve_brush_drag_kind()
+        local k = deps.brush_drag_kind_key()
         local label = (config.drag.BRUSH_DRAG_KIND_LABELS and config.drag.BRUSH_DRAG_KIND_LABELS[k]) or k
         if (k == "nudge" or k == "sculpt") and shift_fine_active() then
             label = label .. " (Fine)"
@@ -170,27 +174,62 @@ function M.new(state, config, modules)
         return label
     end
 
+    deps.brush_mode_falloff_header = function(falloff_label)
+        local k = deps.brush_drag_kind_key()
+        if k == "smooth" then
+            return deps.brush_drag_kind_display()
+        end
+        return deps.brush_drag_kind_display() .. " - " .. falloff_label
+    end
+
     deps.arrange_client_to_imgui = function(x, y)
         return core.arrange_client_to_imgui(state.ctx, core.get_arrange_hwnd, x, y)
     end
 
-    --- Nearly-collinear interior points (screen angle). Smooth + LMB release only; see input.end_drag_operation.
+    --- Smooth LMB up: bezier merge → angle cleanup → bezier merge; see input.end_drag_operation.
     local function run_smooth_angle_cleanup_on_lmb_up()
         if state.active_sculpt_kind ~= "smooth" or not state.target_envelope then
             return
         end
-        ops.remove_redundant_envelope_points_by_angle(
-            config,
-            state.target_envelope,
-            core.track_autoitem_idx(state),
-            deps.envelope_to_screen,
-            nil
-        )
+        local autoitem_idx = core.track_autoitem_idx(state)
+        ops.sort_envelope_points_for_autoitem(state.target_envelope, autoitem_idx)
+        if state.captured_points and #state.captured_points > 0 then
+            deps.refresh_captured_from_envelope(state.target_envelope)
+            input.note_smooth_stroke_capture(state, state.captured_points)
+        end
+        local stroke_times = state.smooth_stroke_point_times
+        local env = state.target_envelope
+        local bezier_on = state.smooth_cleanup_bezier_enabled ~= false
+        local angle_on = state.smooth_cleanup_angle_enabled ~= false
+        if not bezier_on and not angle_on then
+            return
+        end
+        local merge_opts = { bezier_max_err = state.smooth_bezier_fit_tolerance }
+        local deleted = 0
+        if bezier_on then
+            deleted = ops.merge_smooth_stroke_envelope_spans(
+                config, env, autoitem_idx, nil, deps.envelope_value_at_time, stroke_times, merge_opts
+            )
+        end
+        if angle_on then
+            deleted = deleted + ops.remove_redundant_envelope_points_by_angle(
+                config, env, autoitem_idx, deps.envelope_to_screen, nil, stroke_times
+            )
+        end
+        if bezier_on then
+            deleted = deleted + ops.merge_smooth_stroke_envelope_spans(
+                config, env, autoitem_idx, nil, deps.envelope_value_at_time, stroke_times, merge_opts
+            )
+        end
+        if deleted > 0 then
+            state.envelope_stroke_dirty = true
+        end
     end
     deps.run_smooth_angle_cleanup_on_lmb_up = run_smooth_angle_cleanup_on_lmb_up
 
     deps.end_drag_operation = function()
         return input.end_drag_operation(state, {
+            config = config,
             sort_envelope_points_for_autoitem = ops.sort_envelope_points_for_autoitem,
             cleanup_redundant_points_after_drag = run_smooth_angle_cleanup_on_lmb_up,
         })

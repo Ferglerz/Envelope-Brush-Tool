@@ -19,7 +19,8 @@ function M.flags_or(...)
 end
 
 --- Tight layout: match draw-list HUD column (no window padding), reduce frame/item gaps so widgets align with plain text.
-function M.push_settings_layout(ctx)
+function M.push_settings_layout(ctx, row_gap)
+    row_gap = row_gap or 3
     local n = 0
     local function push2(var, a, b)
         if var == nil then return end
@@ -29,9 +30,30 @@ function M.push_settings_layout(ctx)
     end
     push2(reaper.ImGuiStyleVar_WindowPadding, 0, 0)
     push2(reaper.ImGuiStyleVar_FramePadding, 2, 2)
-    push2(reaper.ImGuiStyleVar_ItemSpacing, 4, 3)
+    push2(reaper.ImGuiStyleVar_ItemSpacing, 4, row_gap)
     push2(reaper.ImGuiStyleVar_ItemInnerSpacing, 4, 2)
     return n
+end
+
+--- Default ImGui font at GetFontSize + delta (HUD panel body + settings labels).
+function M.push_hud_font(ctx, delta)
+    if not reaper.ImGui_GetFont or not reaper.ImGui_PushFont or not reaper.ImGui_GetFontSize then
+        return 0
+    end
+    local font = reaper.ImGui_GetFont(ctx)
+    if not font then
+        return 0
+    end
+    delta = delta or 0
+    local sz = reaper.ImGui_GetFontSize(ctx)
+    reaper.ImGui_PushFont(ctx, font, sz + delta)
+    return 1
+end
+
+function M.pop_hud_font(ctx, pushed)
+    if pushed and pushed > 0 and reaper.ImGui_PopFont then
+        reaper.ImGui_PopFont(ctx)
+    end
 end
 
 function M.pop_style_vars(ctx, count)
@@ -80,7 +102,8 @@ function M.push_settings_grey_style(ctx)
 end
 
 --- Grey chip button (draw-list rounded rect; ReaImGui FrameRounding push is unreliable here).
-function M.chip_button(ctx, label, selected, w, h)
+--- `selected_palette` optional `{ normal, hover, active }` (0xRRGGBBAA) when `selected` is true.
+function M.chip_button(ctx, label, selected, w, h, selected_palette)
     if not reaper.ImGui_InvisibleButton then
         return false
     end
@@ -89,7 +112,15 @@ function M.chip_button(ctx, label, selected, w, h)
     local active = reaper.ImGui_IsItemActive(ctx)
     local clicked = reaper.ImGui_IsItemClicked(ctx)
     local col
-    if active then
+    if selected and selected_palette then
+        if active then
+            col = selected_palette.active
+        elseif hovered then
+            col = selected_palette.hover
+        else
+            col = selected_palette.normal
+        end
+    elseif active then
         col = selected and 0x454545FF or 0x303030FF
     elseif hovered then
         col = selected and 0x5E5E5EFF or 0x484848FF
@@ -106,6 +137,27 @@ function M.chip_button(ctx, label, selected, w, h)
         end
     end
     return clicked
+end
+
+--- ImGui-style tick in a square (uses DrawList path API; same look as Checkbox).
+function M.draw_checkmark(draw_list, pos_x, pos_y, size, col)
+    if not draw_list or not reaper.ImGui_DrawList_PathClear or not reaper.ImGui_DrawList_PathStroke then
+        return false
+    end
+    col = col or 0xCCCCCCFF
+    local thickness = math.max(size / 5.0, 1.0)
+    local sz = size - thickness * 0.5
+    local px = pos_x + thickness * 0.25
+    local py = pos_y + thickness * 0.25
+    local third = sz / 3.0
+    local bx = px + third
+    local by = py + sz - third * 0.5
+    reaper.ImGui_DrawList_PathClear(draw_list)
+    reaper.ImGui_DrawList_PathLineTo(draw_list, bx - third, by - third)
+    reaper.ImGui_DrawList_PathLineTo(draw_list, bx, by)
+    reaper.ImGui_DrawList_PathLineTo(draw_list, bx + third * 2.0, by - third * 2.0)
+    reaper.ImGui_DrawList_PathStroke(draw_list, col, 0, thickness)
+    return true
 end
 
 function M.calc_text_w(ctx, s)

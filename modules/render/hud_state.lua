@@ -1,18 +1,38 @@
+local _hud_dir = (((debug.getinfo(1, "S").source or ""):match("^@(.+)$")) or ""):match("^(.*[\\/])") or ""
+local Path = dofile(_hud_dir .. "../path.lua")
+local Util = Path.load_from_modules("util.lua")
+
 local M = {}
 
-function M.brush_hud_interactive(state)
-    return state.sws_hover_detected and state.target_envelope ~= nil
+local function smooth_drag_active(state)
+    return state.is_dragging == true and state.active_sculpt_kind == "smooth"
 end
 
---- Show brush rings: live hover, or settings mode with a frozen position on a locked lane.
-function M.brush_hud_visible(state)
-    if not state.target_envelope then
-        return false
+function M.brush_hud_interactive(state)
+    if state.brush_settings_mode and state.brush_settings_freeze_client then
+        return state.target_envelope ~= nil and state.envelope_lane_hover == true
     end
-    if M.brush_hud_interactive(state) then
+    return Util.brush_tool_active(state)
+end
+
+--- Show brush rings only on live lane hover (not committed stroke off-lane); same alpha gate as hud_panel.
+--- Settings panel: stay visible while open (cursor may be on panel, off lane); REAPER foreground gate is in main loop.
+function M.brush_hud_visible(state)
+    if state.brush_settings_mode and state.brush_settings_freeze_client and state.target_envelope then
         return true
     end
-    return state.brush_settings_mode == true and state.brush_settings_freeze_client ~= nil
+    if not state.target_envelope or state.envelope_lane_hover ~= true then
+        return false
+    end
+    if (state.brush_hud_text_alpha or 1) <= 0.02 and not smooth_drag_active(state) then
+        return false
+    end
+    return true
+end
+
+--- Rings stay up during smooth LMB drag even while HUD text fades out.
+function M.brush_hud_rings_visible(state)
+    return M.brush_hud_visible(state)
 end
 
 --- ImGui (x,y) at brush center: frozen arrange client in settings mode, else live mouse via arrange client → ImGui.

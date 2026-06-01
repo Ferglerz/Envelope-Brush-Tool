@@ -2,6 +2,10 @@
 
 local M = {}
 
+local _mod_dir = (((debug.getinfo(1, "S").source or ""):match("^@(.+)$")) or ""):match("^(.*[\\/])") or ""
+local Path = dofile(_mod_dir .. "path.lua")
+local Util = Path.load_from_modules("util.lua")
+
 local ARRANGE_INTERCEPT_MSGS = {
     "WM_MOUSEWHEEL",
     "WM_LBUTTONDOWN",
@@ -15,7 +19,7 @@ local function suppress_arrange_context_menu(state)
     if state.brush_settings_mode or state.brush_ate_arrange_rmb then
         return true
     end
-    if state.target_envelope and state.sws_hover_detected then
+    if state.target_envelope and (Util.brush_tool_active(state) or state.brush_settings_mode) then
         return true
     end
     return false

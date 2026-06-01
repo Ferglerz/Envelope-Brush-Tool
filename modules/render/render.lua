@@ -11,6 +11,7 @@ local Overlay = Path.load("overlay.lua")
 
 M.brush_hud_interactive = HudState.brush_hud_interactive
 M.brush_hud_visible = HudState.brush_hud_visible
+M.brush_hud_rings_visible = HudState.brush_hud_rings_visible
 M.update_brush_hud_text_fade = HudState.update_brush_hud_text_fade
 
 function M.render_brush_hud_panel(state, config, deps)

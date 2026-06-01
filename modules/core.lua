@@ -17,7 +17,7 @@ function M.new_state(config)
     return {
         -- Brush settings
         brush_size = b.DEFAULT_BRUSH_SIZE,
-        invert_brush_size_scroll = b.DEFAULT_INVERT_BRUSH_SIZE_SCROLL,
+        invert_scroll = b.DEFAULT_INVERT_SCROLL,
         falloff_type = 1,
         falloff_strength = f.DEFAULT_FALLOFF_STRENGTH,
         --- Set on LMB down: "nudge" | "sculpt" | "smooth" (see input.resolve_brush_drag_kind).
@@ -26,6 +26,12 @@ function M.new_state(config)
         min_point_spacing_px = config.spacing.DEFAULT_MIN_POINT_SPACING_PX,
         lock_time_axis = false,
         lock_value_axis = false,
+        --- Smooth LMB-up cleanup (settings panel + project ext).
+        smooth_cleanup_bezier_enabled = config.cleanup.DEFAULT_SMOOTH_CLEANUP_BEZIER_ENABLED,
+        smooth_cleanup_angle_enabled = config.cleanup.DEFAULT_SMOOTH_CLEANUP_ANGLE_ENABLED,
+        smooth_bezier_fit_tolerance = config.cleanup.DEFAULT_BEZIER_FIT_TOLERANCE,
+        hud_hints_enabled = (config.hud and config.hud.DEFAULT_HUD_HINTS_ENABLED) ~= false,
+        hud_info_enabled = (config.hud and config.hud.DEFAULT_HUD_INFO_ENABLED) ~= false,
         --- RMB click (no drag) on lane: freeze brush HUD and show inline settings under the brush.
         brush_settings_mode = false,
         brush_settings_freeze_client = nil,
@@ -36,9 +42,16 @@ function M.new_state(config)
         -- Mouse and interaction
         mouse_pos = {x = 0, y = 0},
         is_dragging = false,
+        --- True from successful on_lmb_pressed (lane hover at press) until LMB up; keeps HUD/ops for whole stroke.
+        brush_stroke_committed = false,
+        --- Set on LMB-down edge while envelope_lane_hover; consumed by on_lmb_pressed (blocks mid-hold lane entry).
+        brush_lmb_press_armed = false,
+        _lmb_was_down_prev = false,
         drag_mode = "sculpt",
         drag_start_pos = {x = 0, y = 0},
         captured_points = {},
+        --- Smooth LMB stroke: project times of every point that entered the brush (merge scope on release).
+        smooth_stroke_point_times = nil,
         last_create_client = nil,
 
         -- Envelope context (REAPER: autoitem_idx -1 = parent lane; >=0 = automation item on that envelope)
@@ -47,6 +60,10 @@ function M.new_state(config)
         envelope_bounds = {top = 150, bottom = 600, left = 200, right = 1200},
         overlay_visible = false,
         sws_hover_detected = false,
+        --- True when cursor is in the target envelope lane (Y + SWS envelope context). Gates HUD, LMB, and point ops.
+        envelope_lane_hover = false,
+        --- True when cursor is near the envelope curve within the lane (proximity hit-test).
+        envelope_curve_hover = false,
 
         -- Cached envelope properties
         cached_envelope_properties = {
@@ -68,9 +85,9 @@ function M.new_state(config)
         -- Last raw client rect from JS_Window_GetClientRect (for setup_envelope_bounds skip-if-unchanged)
         _arrange_client_rect_key = nil,
 
-        -- Undo system
-        undo_active = false,
-        undo_operation_name = "",
+        -- Undo: one Undo_OnStateChangeEx2 per completed LMB stroke (no Begin/End — avoids open blocks merging strokes).
+        pending_undo_label = nil,
+        envelope_stroke_dirty = false,
         sculpt_sort_pending = false,
         sculpt_last_client = nil,
         --- reaper.time_precise() when Envelope_SortPoints* last ran during sculpt. Set at LMB so the first move does not
@@ -129,6 +146,9 @@ function M.new_state(config)
         seed_hover_cache = nil,
         seed_hover_last_client = nil,
 
+        -- Per-envelope: true if CountAutomationItems > 0 (see envelope_api.envelope_has_automation_items).
+        envelope_ai_lane_cache = nil,
+
     }
 end
 
@@ -142,6 +162,14 @@ end
 
 function M.track_autoitem_idx(state)
     return Util.track_autoitem_idx(state)
+end
+
+function M.brush_tool_active(state)
+    return Util.brush_tool_active(state)
+end
+
+function M.brush_lmb_may_start_stroke(state)
+    return Util.brush_lmb_may_start_stroke(state)
 end
 
 --- While sculpt_sort_pending: sort at most every ENVELOPE_SORT_INTERVAL_SEC.

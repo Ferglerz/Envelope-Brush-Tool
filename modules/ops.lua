@@ -5,13 +5,14 @@ local Path = dofile(_mod_dir .. "path.lua")
 local EnvApi = Path.load_from_modules("envelope/envelope_api.lua")
 local ValueScaling = Path.load_from_modules("envelope/value_scaling.lua")
 local Mods = Path.load_from_modules("mods.lua")
+local BezierFit = Path.load_from_modules("bezier_fit.lua")
 
 local function count_envelope_points(envelope, autoitem_idx)
-    return reaper.CountEnvelopePoints(envelope)
+    return reaper.CountEnvelopePointsEx(envelope, autoitem_idx or -1)
 end
 
 local function get_envelope_point(envelope, autoitem_idx, i)
-    local ok, t, v, shape, tension, selected = reaper.GetEnvelopePoint(envelope, i)
+    local ok, t, v, shape, tension, selected = reaper.GetEnvelopePointEx(envelope, autoitem_idx or -1, i)
     if not ok then
         return false, nil, nil, shape, tension, selected
     end
@@ -19,18 +20,16 @@ local function get_envelope_point(envelope, autoitem_idx, i)
 end
 
 local function set_envelope_point(envelope, autoitem_idx, i, t, v, shape, tension, sel, no_sort)
-    return reaper.SetEnvelopePoint(envelope, i, t, ValueScaling.linear_value_to_api(envelope, v), shape, tension, sel, no_sort)
+    return reaper.SetEnvelopePointEx(envelope, autoitem_idx or -1, i, t, ValueScaling.linear_value_to_api(envelope, v), shape, tension, sel, no_sort)
 end
 
 local function insert_envelope_point(envelope, autoitem_idx, t, v, shape, tension, sel, no_sort)
-    return reaper.InsertEnvelopePoint(envelope, t, ValueScaling.linear_value_to_api(envelope, v), shape, tension, sel, no_sort)
+    return reaper.InsertEnvelopePointEx(envelope, autoitem_idx or -1, t, ValueScaling.linear_value_to_api(envelope, v), shape, tension, sel, no_sort)
 end
 
 function M.sort_envelope_points_for_autoitem(envelope, autoitem_idx)
     if not envelope then return end
-    if reaper.Envelope_SortPoints then
-        reaper.Envelope_SortPoints(envelope)
-    end
+    reaper.Envelope_SortPointsEx(envelope, autoitem_idx or -1)
 end
 
 local function sort_envelope_points(envelope, autoitem_idx)
@@ -61,12 +60,596 @@ local function adjust_captured_indices_after_delete(captured_points, deleted_idx
     end
 end
 
-local function interior_angle_deg(sax, say, sbx, sby, scx, scy)
-    local bax, bay = sax - sbx, say - sby
-    local bcx, bcy = scx - sbx, scy - sby
+local ENVELOPE_SHAPE_LINEAR = 0
+local ENVELOPE_SHAPE_BEZIER = 5
+
+--- Outgoing segment at insert_t uses the time-left point's shape; new points on bezier spans → linear.
+local function shape_and_tension_for_new_insert(envelope, autoitem_idx, insert_t, default_shape, eps_t)
+    eps_t = eps_t or 1e-12
+    local fallback = (type(default_shape) == "number" and default_shape) or ENVELOPE_SHAPE_LINEAR
+    if not envelope or insert_t == nil or insert_t ~= insert_t then
+        return fallback, 0
+    end
+    local left_time = -math.huge
+    local left_shape = nil
+    local n = count_envelope_points(envelope, autoitem_idx)
+    for i = 0, n - 1 do
+        local ok, t, _v, shape = get_envelope_point(envelope, autoitem_idx, i)
+        if ok and t ~= nil and t <= insert_t + eps_t and t >= left_time then
+            left_time = t
+            left_shape = shape
+        end
+    end
+    if left_shape == ENVELOPE_SHAPE_BEZIER then
+        return ENVELOPE_SHAPE_LINEAR, 0
+    end
+    return fallback, 0
+end
+
+local function gap_samples_for_interior(interior_count, per_gap, min_interior, long_interior)
+    if not per_gap or per_gap <= 0 or interior_count < 2 then
+        return 0
+    end
+    min_interior = min_interior or 2
+    long_interior = long_interior or 5
+    if interior_count >= long_interior then
+        return per_gap * 2
+    end
+    if interior_count >= min_interior then
+        return per_gap
+    end
+    return 0
+end
+
+local function rebuild_sorted_rows(envelope, autoitem_idx)
+    local n = count_envelope_points(envelope, autoitem_idx)
+    local rows = {}
+    for i = 0, n - 1 do
+        local ok, t, v, shape, tension, selected = get_envelope_point(envelope, autoitem_idx, i)
+        if ok and t ~= nil and v ~= nil then
+            rows[#rows + 1] = {
+                idx = i, time = t, val = v,
+                shape = shape, tension = tension, selected = selected,
+            }
+        end
+    end
+    table.sort(rows, function(a, b)
+        if a.time ~= b.time then return a.time < b.time end
+        return a.idx < b.idx
+    end)
+    return rows
+end
+
+local function find_row_by_time(rows, time, eps_t)
+    for i = 1, #rows do
+        if math.abs(rows[i].time - time) <= eps_t then
+            return rows[i]
+        end
+    end
+    return nil
+end
+
+local function set_outgoing_segment(envelope, autoitem_idx, row, shape, tension)
+    return set_envelope_point(
+        envelope, autoitem_idx, row.idx, row.time, row.val,
+        shape, tension, row.selected, true
+    )
+end
+
+local function snapshot_row(row)
+    return {
+        idx = row.idx,
+        time = row.time,
+        val = row.val,
+        shape = row.shape,
+        tension = row.tension,
+        selected = row.selected,
+    }
+end
+
+local function interpolate_sorted_rows_value(rows, t)
+    if not rows or #rows == 0 or t == nil or t ~= t then
+        return nil
+    end
+    if t <= rows[1].time then
+        return rows[1].val
+    end
+    if t >= rows[#rows].time then
+        return rows[#rows].val
+    end
+    for k = 1, #rows - 1 do
+        local a, b = rows[k], rows[k + 1]
+        if t >= a.time and t <= b.time then
+            local dt = b.time - a.time
+            if dt <= 1e-18 then
+                return a.val
+            end
+            local u = (t - a.time) / dt
+            return a.val + (b.val - a.val) * u
+        end
+    end
+    return nil
+end
+
+local function measure_targets_fit_error(envelope_value_at_time, envelope, targets)
+    local max_val = 0
+    for i = 1, #targets do
+        local s = targets[i]
+        local v_fit = envelope_value_at_time(envelope, s.t)
+        if v_fit == nil or v_fit ~= v_fit then
+            return math.huge
+        end
+        local dv = math.abs(v_fit - s.v)
+        if dv > max_val then
+            max_val = dv
+        end
+    end
+    return max_val
+end
+
+local function fit_within_tolerance(max_val, tol_val)
+    if not tol_val or tol_val <= 0 then
+        return false
+    end
+    return max_val <= tol_val
+end
+
+local function build_span_fit_targets(rows, left_i, right_i, extra_samples_per_gap)
+    local targets = {}
+    local seen = {}
+    local function add_target(t, v)
+        if t == nil or t ~= t or v == nil or v ~= v then
+            return false
+        end
+        local key = math.floor(t * 1e12 + 0.5)
+        if seen[key] then
+            return true
+        end
+        seen[key] = true
+        targets[#targets + 1] = { t = t, v = v }
+        return true
+    end
+
+    for k = left_i + 1, right_i - 1 do
+        if not add_target(rows[k].time, rows[k].val) then
+            return nil
+        end
+    end
+
+    extra_samples_per_gap = extra_samples_per_gap or 0
+    if extra_samples_per_gap > 0 then
+        for k = left_i, right_i - 1 do
+            local t0, t1 = rows[k].time, rows[k + 1].time
+            if t1 > t0 then
+                for s = 1, extra_samples_per_gap do
+                    local t = t0 + (t1 - t0) * (s / (extra_samples_per_gap + 1))
+                    local v = interpolate_sorted_rows_value(rows, t)
+                    if not add_target(t, v) then
+                        return nil
+                    end
+                end
+            end
+        end
+    end
+
+    return targets
+end
+
+local function fit_outgoing_to_targets(
+    envelope, autoitem_idx, left, right, targets, envelope_value_at_time,
+    tol_linear, tol_bezier, bezier_min_gain, chord_dev, arc_chord_min, schneider_newton_iters, tension_search_radius
+)
+    arc_chord_min = arc_chord_min or tol_linear
+    local arc_like = chord_dev ~= nil and chord_dev > arc_chord_min
+
+    set_outgoing_segment(envelope, autoitem_idx, left, ENVELOPE_SHAPE_LINEAR, 0)
+    local linear_val = measure_targets_fit_error(envelope_value_at_time, envelope, targets)
+
+    if fit_within_tolerance(linear_val, tol_linear) and not arc_like then
+        return ENVELOPE_SHAPE_LINEAR, 0, linear_val
+    end
+
+    local norm_pts = BezierFit.window_points_normalized(
+        left.time, left.val, right.time, right.val, targets
+    )
+    if not norm_pts then
+        if arc_like then
+            return nil, nil, nil
+        end
+        if fit_within_tolerance(linear_val, tol_linear) then
+            return ENVELOPE_SHAPE_LINEAR, 0, linear_val
+        end
+        return ENVELOPE_SHAPE_LINEAR, 0, linear_val
+    end
+
+    local schneider = BezierFit.schneider_cubic(norm_pts, { newton_iters = schneider_newton_iters or 2 })
+    if not schneider then
+        if arc_like then
+            return nil, nil, nil
+        end
+        if fit_within_tolerance(linear_val, tol_linear) then
+            return ENVELOPE_SHAPE_LINEAR, 0, linear_val
+        end
+        return ENVELOPE_SHAPE_LINEAR, 0, linear_val
+    end
+
+    local function set_bezier_tension(tens)
+        set_outgoing_segment(envelope, autoitem_idx, left, ENVELOPE_SHAPE_BEZIER, tens)
+    end
+
+    local function measure_err()
+        return measure_targets_fit_error(envelope_value_at_time, envelope, targets)
+    end
+
+    local best_tension, best_val = BezierFit.find_best_reaper_tension(
+        set_bezier_tension,
+        measure_err,
+        schneider.tension_hint,
+        tension_search_radius,
+        12
+    )
+
+    if not best_tension or best_val == nil then
+        if arc_like then
+            set_outgoing_segment(envelope, autoitem_idx, left, ENVELOPE_SHAPE_LINEAR, 0)
+            return nil, nil, nil
+        end
+        if fit_within_tolerance(linear_val, tol_linear) then
+            return ENVELOPE_SHAPE_LINEAR, 0, linear_val
+        end
+        set_outgoing_segment(envelope, autoitem_idx, left, ENVELOPE_SHAPE_LINEAR, 0)
+        return ENVELOPE_SHAPE_LINEAR, 0, linear_val
+    end
+
+    if not fit_within_tolerance(best_val, tol_bezier) then
+        if arc_like then
+            set_outgoing_segment(envelope, autoitem_idx, left, ENVELOPE_SHAPE_LINEAR, 0)
+            return nil, nil, nil
+        end
+        if fit_within_tolerance(linear_val, tol_linear) then
+            set_outgoing_segment(envelope, autoitem_idx, left, ENVELOPE_SHAPE_LINEAR, 0)
+            return ENVELOPE_SHAPE_LINEAR, 0, linear_val
+        end
+        set_outgoing_segment(envelope, autoitem_idx, left, ENVELOPE_SHAPE_LINEAR, 0)
+        return ENVELOPE_SHAPE_LINEAR, 0, linear_val
+    end
+
+    bezier_min_gain = bezier_min_gain or 0
+    if bezier_min_gain < 0 then bezier_min_gain = 0 end
+    if not arc_like and bezier_min_gain > 0 and (linear_val - best_val) < bezier_min_gain then
+        if fit_within_tolerance(linear_val, tol_linear) then
+            set_outgoing_segment(envelope, autoitem_idx, left, ENVELOPE_SHAPE_LINEAR, 0)
+            return ENVELOPE_SHAPE_LINEAR, 0, linear_val
+        end
+    end
+
+    set_outgoing_segment(envelope, autoitem_idx, left, ENVELOPE_SHAPE_BEZIER, best_tension)
+    return ENVELOPE_SHAPE_BEZIER, best_tension, best_val
+end
+
+local function delete_envelope_rows(envelope, autoitem_idx, row_snaps, captured_points)
+    local idxs = {}
+    for i = 1, #row_snaps do
+        idxs[#idxs + 1] = row_snaps[i].idx
+    end
+    table.sort(idxs, function(a, b) return a > b end)
+    local deleted = 0
+    for _, d in ipairs(idxs) do
+        if reaper.DeleteEnvelopePointEx(envelope, autoitem_idx, d) then
+            deleted = deleted + 1
+            adjust_captured_indices_after_delete(captured_points, d)
+        end
+    end
+    return deleted
+end
+
+local function restore_interior_rows(envelope, autoitem_idx, interior_snaps)
+    for i = 1, #interior_snaps do
+        local p = interior_snaps[i]
+        insert_envelope_point(
+            envelope, autoitem_idx, p.time, p.val,
+            p.shape or ENVELOPE_SHAPE_LINEAR, p.tension or 0,
+            p.selected or false, true
+        )
+    end
+    sort_envelope_points(envelope, autoitem_idx)
+end
+
+local function restore_left_outgoing_segment(envelope, autoitem_idx, left_time, left_seg)
+    local rows = rebuild_sorted_rows(envelope, autoitem_idx)
+    local left = find_row_by_time(rows, left_time, 1e-9)
+    if left then
+        set_outgoing_segment(
+            envelope, autoitem_idx, left,
+            left_seg.shape or ENVELOPE_SHAPE_LINEAR, left_seg.tension or 0
+        )
+    end
+end
+
+local function rollback_window_trial(envelope, autoitem_idx, interior_snaps, left_time, left_seg)
+    restore_interior_rows(envelope, autoitem_idx, interior_snaps)
+    restore_left_outgoing_segment(envelope, autoitem_idx, left_time, left_seg)
+end
+
+--- Average |value − chord| for interior points (linear between left/right anchors in time).
+local function interior_chord_deviation_val(rows, left_i, right_i)
+    local left, right = rows[left_i], rows[right_i]
+    local t0, t1 = left.time, right.time
+    local v0, v1 = left.val, right.val
+    local dt = t1 - t0
+    if dt <= 1e-18 then
+        return 0
+    end
+    local sum = 0
+    local n = 0
+    for k = left_i + 1, right_i - 1 do
+        local mid = rows[k]
+        local u = (mid.time - t0) / dt
+        local v_line = v0 + (v1 - v0) * u
+        sum = sum + math.abs(mid.val - v_line)
+        n = n + 1
+    end
+    if n == 0 then
+        return 0
+    end
+    return sum / n
+end
+
+local function stroke_time_key(t)
+    return math.floor(t * 1e9 + 0.5)
+end
+
+local function freeze_stroke_point_times(stroke_point_times)
+    if not stroke_point_times or next(stroke_point_times) == nil then
+        return nil, nil
+    end
+    local frozen = {}
+    local t_lo, t_hi = math.huge, -math.huge
+    for _, t in pairs(stroke_point_times) do
+        if type(t) == "number" and t == t then
+            frozen[stroke_time_key(t)] = t
+            if t < t_lo then t_lo = t end
+            if t > t_hi then t_hi = t end
+        end
+    end
+    if next(frozen) == nil then
+        return nil, nil
+    end
+    local span = t_hi - t_lo
+    local eps_t = math.max(1e-6, span * 1e-7)
+    return frozen, eps_t
+end
+
+local function row_time_in_stroke(t, stroke_point_times, eps_t)
+    if not stroke_point_times or t == nil or t ~= t then
+        return false
+    end
+    local key = math.floor(t * 1e9 + 0.5)
+    if stroke_point_times[key] then
+        return true
+    end
+    for _, st in pairs(stroke_point_times) do
+        if math.abs(st - t) <= eps_t then
+            return true
+        end
+    end
+    return false
+end
+
+local function window_interiors_in_stroke(rows, left_i, right_i, stroke_point_times, eps_t)
+    for k = left_i + 1, right_i - 1 do
+        if not row_time_in_stroke(rows[k].time, stroke_point_times, eps_t) then
+            return false
+        end
+    end
+    return true
+end
+
+local function build_stroke_row_scope(rows, stroke_point_times, min_interior, eps_t)
+    if not stroke_point_times then
+        return nil
+    end
+    local lo, hi, stroke_count = nil, nil, 0
+    for i = 1, #rows do
+        if row_time_in_stroke(rows[i].time, stroke_point_times, eps_t) then
+            lo = lo or i
+            hi = i
+            stroke_count = stroke_count + 1
+        end
+    end
+    if not lo or stroke_count < min_interior then
+        return nil
+    end
+    local left_i_min = math.max(1, lo - 1)
+    local left_i_max = hi - min_interior
+    if left_i_max < left_i_min then
+        return nil
+    end
+    return {
+        lo = lo,
+        hi = hi,
+        stroke_count = stroke_count,
+        left_i_min = left_i_min,
+        left_i_max = left_i_max,
+        max_right_cap = math.min(#rows, hi + 1),
+    }
+end
+
+--- Trial merge: delete interiors, fit span to pre-merge point curve, restore unless commit.
+local function try_window_merge(
+    envelope, autoitem_idx, rows, left_i, right_i,
+    envelope_value_at_time, tol_linear, tol_bezier, bezier_min_gain, arc_chord_min,
+    schneider_newton_iters, tension_search_radius,
+    captured_points, extra_samples_per_gap, extra_samples_min_interior, extra_samples_long_interior,
+    stroke_point_times, eps_t, commit
+)
+    local interior_count = right_i - left_i - 1
+    if interior_count < 1 then
+        return nil
+    end
+    if stroke_point_times and not window_interiors_in_stroke(rows, left_i, right_i, stroke_point_times, eps_t) then
+        return nil
+    end
+
+    local chord_dev = interior_chord_deviation_val(rows, left_i, right_i)
+
+    local gap_samples = gap_samples_for_interior(
+        interior_count, extra_samples_per_gap, extra_samples_min_interior, extra_samples_long_interior
+    )
+    local targets = build_span_fit_targets(rows, left_i, right_i, gap_samples)
+    if not targets or #targets == 0 then
+        return nil
+    end
+
+    local left_row = rows[left_i]
+    local left_seg = snapshot_row(left_row)
+    local interior_snaps = {}
+    for k = left_i + 1, right_i - 1 do
+        interior_snaps[#interior_snaps + 1] = snapshot_row(rows[k])
+    end
+
+    local deleted = delete_envelope_rows(envelope, autoitem_idx, interior_snaps, captured_points)
+    if deleted ~= interior_count then
+        rollback_window_trial(envelope, autoitem_idx, interior_snaps, left_row.time, left_seg)
+        return nil
+    end
+
+    local post_rows = rebuild_sorted_rows(envelope, autoitem_idx)
+    local left = find_row_by_time(post_rows, left_row.time, 1e-9)
+    if not left then
+        rollback_window_trial(envelope, autoitem_idx, interior_snaps, left_row.time, left_seg)
+        return nil
+    end
+
+    local right_row = rows[right_i]
+
+    local best_shape, best_tension, fit_val = fit_outgoing_to_targets(
+        envelope, autoitem_idx, left, right_row, targets, envelope_value_at_time,
+        tol_linear, tol_bezier, bezier_min_gain, chord_dev, arc_chord_min,
+        schneider_newton_iters, tension_search_radius
+    )
+
+    if not best_shape or fit_val == nil then
+        rollback_window_trial(envelope, autoitem_idx, interior_snaps, left_row.time, left_seg)
+        return nil
+    end
+
+    local fit_tol = (best_shape == ENVELOPE_SHAPE_BEZIER) and tol_bezier or tol_linear
+    if not fit_within_tolerance(fit_val, fit_tol) then
+        rollback_window_trial(envelope, autoitem_idx, interior_snaps, left_row.time, left_seg)
+        return nil
+    end
+
+    -- Curved interiors must survive as bezier; linear merge only when already nearly collinear in value.
+    if best_shape == ENVELOPE_SHAPE_LINEAR and chord_dev > tol_linear then
+        rollback_window_trial(envelope, autoitem_idx, interior_snaps, left_row.time, left_seg)
+        return nil
+    end
+
+    local fit_cost = fit_val + 1e-9
+    local score = interior_count * interior_count * (chord_dev + 1.0) / fit_cost
+    if best_shape == ENVELOPE_SHAPE_BEZIER then
+        score = score * (1.0 + chord_dev)
+    end
+    local result = {
+        left_i = left_i,
+        right_i = right_i,
+        left_time = left_row.time,
+        interior_count = interior_count,
+        best_shape = best_shape,
+        best_tension = best_tension,
+        fit_val = fit_val,
+        chord_dev = chord_dev,
+        score = score,
+    }
+
+    if not commit then
+        rollback_window_trial(envelope, autoitem_idx, interior_snaps, left_row.time, left_seg)
+    end
+
+    return result
+end
+
+--- Apply a trial result without re-running fit search (commit path).
+local function apply_window_merge(envelope, autoitem_idx, rows, left_i, right_i, merge, captured_points)
+    local interior_count = right_i - left_i - 1
+    if interior_count < 1 or not merge then
+        return 0
+    end
+    local left_row = rows[left_i]
+    local interior_snaps = {}
+    for k = left_i + 1, right_i - 1 do
+        interior_snaps[#interior_snaps + 1] = snapshot_row(rows[k])
+    end
+    local deleted = delete_envelope_rows(envelope, autoitem_idx, interior_snaps, captured_points)
+    if deleted ~= interior_count then
+        return 0
+    end
+    local post_rows = rebuild_sorted_rows(envelope, autoitem_idx)
+    local left = find_row_by_time(post_rows, left_row.time, 1e-9)
+    if not left then
+        return 0
+    end
+    set_outgoing_segment(
+        envelope, autoitem_idx, left,
+        merge.best_shape or ENVELOPE_SHAPE_LINEAR,
+        merge.best_tension or 0
+    )
+    return interior_count
+end
+
+--- Longest window from left_i that still fits tolerance (binary search on right anchor).
+local function find_longest_merge_from_left(
+    envelope, autoitem_idx, rows, left_i, min_interior, max_interior,
+    envelope_value_at_time, tol_linear, tol_bezier, bezier_min_gain, arc_chord_min,
+    schneider_newton_iters, tension_search_radius,
+    captured_points, extra_samples_per_gap, extra_samples_min_interior, extra_samples_long_interior,
+    stroke_point_times, eps_t, max_right_cap
+)
+    local min_right = left_i + min_interior + 1
+    local max_right = math.min(#rows, left_i + max_interior + 1, max_right_cap or #rows)
+    if min_right > max_right then
+        return nil
+    end
+
+    local best = nil
+    local lo, hi = min_right, max_right
+    while lo <= hi do
+        local mid = math.floor((lo + hi) * 0.5)
+        local cand = try_window_merge(
+            envelope, autoitem_idx, rows, left_i, mid,
+            envelope_value_at_time, tol_linear, tol_bezier, bezier_min_gain, arc_chord_min,
+            schneider_newton_iters, tension_search_radius,
+            captured_points, extra_samples_per_gap, extra_samples_min_interior, extra_samples_long_interior,
+            stroke_point_times, eps_t, false
+        )
+        if cand then
+            best = cand
+            lo = mid + 1
+        else
+            hi = mid - 1
+        end
+    end
+    return best
+end
+
+local function effective_max_interior(ccfg, row_count, min_interior)
+    local cap = ccfg.BEZIER_MERGE_MAX_INTERIOR
+    if cap == nil then
+        cap = 64
+    end
+    if cap <= 0 then
+        cap = math.max(min_interior, row_count - 2)
+    end
+    return cap
+end
+
+local function interior_angle_deg(ax, ay, bx, by, cx, cy)
+    local bax, bay = ax - bx, ay - by
+    local bcx, bcy = cx - bx, cy - by
     local len_a = math.sqrt(bax * bax + bay * bay)
     local len_c = math.sqrt(bcx * bcx + bcy * bcy)
-    if len_a < 1e-6 or len_c < 1e-6 then
+    if len_a < 1e-12 or len_c < 1e-12 then
         return nil
     end
     local cos_a = (bax * bcx + bay * bcy) / (len_a * len_c)
@@ -78,45 +661,141 @@ local function interior_angle_deg(sax, say, sbx, sby, scx, scy)
     return math.deg(math.acos(cos_a))
 end
 
---- Remove interior points nearly collinear in arrange screen space (time-sorted neighbors).
---- Repeats until no removals. Caller: smooth mode, LMB release only (not min_point_spacing_px).
-function M.remove_redundant_envelope_points_by_angle(config, envelope, autoitem_idx, envelope_to_screen, captured_points)
+--- Greedy window merge on smooth LMB up: stroke-scoped anchors, drop interiors when a span fits.
+function M.merge_smooth_stroke_envelope_spans(
+    config, envelope, autoitem_idx, captured_points, envelope_value_at_time, stroke_point_times, merge_opts
+)
+    if not envelope or not config or not envelope_value_at_time then
+        return 0
+    end
+    local frozen_stroke, eps_t = freeze_stroke_point_times(stroke_point_times)
+    if not frozen_stroke then
+        return 0
+    end
+
+    local ccfg = config.cleanup or {}
+    local min_interior = ccfg.BEZIER_MERGE_MIN_INTERIOR or 2
+    if min_interior < 1 then min_interior = 1 end
+    local tol_linear = ccfg.BEZIER_MERGE_MAX_ERR or 0.0001
+    if tol_linear < 0 then tol_linear = 0 end
+    local tol_bezier = (merge_opts and merge_opts.bezier_max_err) or ccfg.BEZIER_MERGE_MAX_ERR_BEZIER or 0.015
+    if tol_bezier < 0 then tol_bezier = 0 end
+    local bezier_min_gain = ccfg.BEZIER_MERGE_BEZIER_MIN_GAIN or 0.00001
+    if bezier_min_gain < 0 then bezier_min_gain = 0 end
+    local arc_chord_min = ccfg.BEZIER_MERGE_ARC_CHORD_MIN or tol_linear
+    if arc_chord_min < 0 then arc_chord_min = 0 end
+    local schneider_newton_iters = ccfg.BEZIER_MERGE_SCHNEIDER_NEWTON_ITER or 2
+    if schneider_newton_iters < 0 then schneider_newton_iters = 0 end
+    local tension_search_radius = ccfg.BEZIER_MERGE_TENSION_SEARCH_RADIUS or 0.35
+    if tension_search_radius <= 0 then tension_search_radius = 0.35 end
+    local extra_samples = ccfg.BEZIER_MERGE_EXTRA_SAMPLES_PER_GAP or 2
+    if extra_samples < 0 then extra_samples = 0 end
+    local extra_samples_min_interior = ccfg.BEZIER_MERGE_EXTRA_SAMPLES_MIN_INTERIOR or 2
+    if extra_samples_min_interior < 1 then extra_samples_min_interior = 1 end
+    local extra_samples_long_interior = ccfg.BEZIER_MERGE_EXTRA_SAMPLES_LONG_INTERIOR or 5
+    if extra_samples_long_interior < 1 then extra_samples_long_interior = 1 end
+    local max_passes = ccfg.BEZIER_MERGE_MAX_PASSES or 16
+    if max_passes < 1 then max_passes = 1 end
+
+    local total_deleted = 0
+    local pass = 0
+    while pass < max_passes do
+        pass = pass + 1
+        local rows = rebuild_sorted_rows(envelope, autoitem_idx)
+        local scope = build_stroke_row_scope(rows, frozen_stroke, min_interior, eps_t)
+        if not scope then
+            break
+        end
+        local max_interior = effective_max_interior(ccfg, #rows, min_interior)
+        max_interior = math.min(max_interior, scope.hi - scope.lo + 1)
+
+        local best = nil
+        for left_i = scope.left_i_min, scope.left_i_max do
+            local cand = find_longest_merge_from_left(
+                envelope, autoitem_idx, rows, left_i, min_interior, max_interior,
+                envelope_value_at_time, tol_linear, tol_bezier, bezier_min_gain, arc_chord_min,
+                schneider_newton_iters, tension_search_radius,
+                captured_points, extra_samples, extra_samples_min_interior, extra_samples_long_interior,
+                frozen_stroke, eps_t, scope.max_right_cap
+            )
+            if cand and (not best or cand.score > best.score) then
+                best = cand
+            end
+        end
+
+        if not best then
+            break
+        end
+
+        rows = rebuild_sorted_rows(envelope, autoitem_idx)
+        local left_i, right_i = nil, nil
+        for i = 1, #rows do
+            if math.abs(rows[i].time - best.left_time) <= eps_t then
+                left_i = i
+                break
+            end
+        end
+        if not left_i then
+            break
+        end
+        right_i = left_i + best.interior_count + 1
+        if right_i > #rows then
+            break
+        end
+
+        local n = apply_window_merge(envelope, autoitem_idx, rows, left_i, right_i, best, captured_points)
+        if n <= 0 then
+            break
+        end
+        total_deleted = total_deleted + n
+    end
+
+    if total_deleted > 0 then
+        sort_envelope_points(envelope, autoitem_idx)
+        reaper.UpdateArrange()
+    end
+    return total_deleted
+end
+
+--- After bezier merge: remove stroke-scoped interior points nearly collinear on screen.
+function M.remove_redundant_envelope_points_by_angle(
+    config, envelope, autoitem_idx, envelope_to_screen, captured_points, stroke_point_times
+)
     if not envelope or not envelope_to_screen or not config then
         return 0
     end
-    local ccfg = config.cleanup
-    local min_angle = (ccfg and ccfg.REDUNDANT_POINT_MIN_ANGLE_DEG) or 175
+    local frozen_stroke, eps_t = freeze_stroke_point_times(stroke_point_times)
+    if not frozen_stroke then
+        return 0
+    end
+
+    local ccfg = config.cleanup or {}
+    local min_angle = ccfg.REDUNDANT_POINT_MIN_ANGLE_DEG or 175
     if min_angle < 0 then min_angle = 0 elseif min_angle > 180 then min_angle = 180 end
+    local max_passes = ccfg.ANGLE_CLEANUP_MAX_PASSES or 64
+    if max_passes < 1 then max_passes = 1 end
 
     local total_deleted = 0
-    while true do
-        local n = count_envelope_points(envelope, autoitem_idx)
-        if n < 3 then break end
-
-        local rows = {}
-        for i = 0, n - 1 do
-            local ok, t, v = get_envelope_point(envelope, autoitem_idx, i)
-            if ok and t ~= nil and v ~= nil then
-                rows[#rows + 1] = { idx = i, time = t, val = v }
-            end
+    local pass = 0
+    while pass < max_passes do
+        pass = pass + 1
+        local rows = rebuild_sorted_rows(envelope, autoitem_idx)
+        if #rows < 3 then
+            break
         end
-        if #rows < 3 then break end
-
-        table.sort(rows, function(a, b)
-            if a.time ~= b.time then return a.time < b.time end
-            return a.idx < b.idx
-        end)
 
         local mark = {}
         for k = 2, #rows - 1 do
             local prev, mid, nxt = rows[k - 1], rows[k], rows[k + 1]
-            local sax, say = envelope_to_screen(prev.time, prev.val, envelope)
-            local sbx, sby = envelope_to_screen(mid.time, mid.val, envelope)
-            local scx, sccy = envelope_to_screen(nxt.time, nxt.val, envelope)
-            if sax and say and sbx and sby and scx and sccy then
-                local ang = interior_angle_deg(sax, say, sbx, sby, scx, sccy)
-                if ang and ang >= min_angle then
-                    mark[mid.idx] = true
+            if row_time_in_stroke(mid.time, frozen_stroke, eps_t) then
+                local sax, say = envelope_to_screen(prev.time, prev.val, envelope)
+                local sbx, sby = envelope_to_screen(mid.time, mid.val, envelope)
+                local scx, scy = envelope_to_screen(nxt.time, nxt.val, envelope)
+                if sax and say and sbx and sby and scx and scy then
+                    local ang = interior_angle_deg(sax, say, sbx, sby, scx, scy)
+                    if ang and ang >= min_angle then
+                        mark[mid.idx] = true
+                    end
                 end
             end
         end
@@ -125,18 +804,26 @@ function M.remove_redundant_envelope_points_by_angle(config, envelope, autoitem_
         for idx, _ in pairs(mark) do
             dels[#dels + 1] = idx
         end
-        if #dels == 0 then break end
+        if #dels == 0 then
+            break
+        end
 
         table.sort(dels, function(a, b) return a > b end)
+        local deleted_this_pass = 0
         for _, d in ipairs(dels) do
             if reaper.DeleteEnvelopePointEx(envelope, autoitem_idx, d) then
-                total_deleted = total_deleted + 1
+                deleted_this_pass = deleted_this_pass + 1
                 adjust_captured_indices_after_delete(captured_points, d)
             end
         end
+        if deleted_this_pass == 0 then
+            break
+        end
+        total_deleted = total_deleted + deleted_this_pass
     end
 
     if total_deleted > 0 then
+        sort_envelope_points(envelope, autoitem_idx)
         reaper.UpdateArrange()
     end
     return total_deleted
@@ -599,8 +1286,6 @@ function M.create_points_in_brush_area(state, config, mouse_x, mouse_y, radius, 
     local pixel_width = bounds.right - bounds.left
     if pixel_width <= 0 then return 0 end
 
-    local shape_in = (type(default_point_shape) == "number" and default_point_shape) or 0
-
     local radius_time = (radius / pixel_width) * time_range
     local points_created = 0
     local eps_ins = math.max(1e-12, math.abs(time_range) * 1e-14)
@@ -665,7 +1350,10 @@ function M.create_points_in_brush_area(state, config, mouse_x, mouse_y, radius, 
             local sx, sy = c.sx, c.sy
             if insert_t ~= nil and new_value ~= nil and sx and sy and not insert_t_already_placed(placed_insert_t, insert_t, eps_ins) then
                 if min_space <= 0 or min_dist_to_point_list(sx, sy) >= min_space then
-                    local tension, selected, noSortIn = 0, false, true
+                    local shape_in, tension = shape_and_tension_for_new_insert(
+                        envelope, autoitem_idx, insert_t, default_point_shape, eps_ins
+                    )
+                    local selected, noSortIn = false, true
                     if insert_envelope_point(envelope, autoitem_idx, insert_t, new_value, shape_in, tension, selected, noSortIn) then
                         points_created = points_created + 1
                         placed_insert_t[#placed_insert_t + 1] = insert_t
@@ -709,7 +1397,10 @@ function M.create_points_in_brush_area(state, config, mouse_x, mouse_y, radius, 
                         local sx, sy = envelope_to_screen(t_vis, new_value, envelope)
                         if sx and sy then
                             if min_space <= 0 or min_dist_to_point_list(sx, sy) >= min_space then
-                                local tension, selected, noSortIn = 0, false, true
+                                local shape_in, tension = shape_and_tension_for_new_insert(
+                                    envelope, autoitem_idx, insert_t, default_point_shape, eps_ins
+                                )
+                                local selected, noSortIn = false, true
                                 if insert_envelope_point(envelope, autoitem_idx, insert_t, new_value, shape_in, tension, selected, noSortIn) then
                                     points_created = points_created + 1
                                     placed_insert_t[#placed_insert_t + 1] = insert_t
@@ -749,8 +1440,8 @@ function M.insert_one_point_at_screen(envelope, autoitem_idx, mx, my, screen_to_
     if ins_t == nil then
         return false
     end
-    local shape_in = (type(default_point_shape) == "number" and default_point_shape) or 0
-    local ok = insert_envelope_point(envelope, autoitem_idx, ins_t, v, shape_in, 0, false, false)
+    local shape_in, tension = shape_and_tension_for_new_insert(envelope, autoitem_idx, ins_t, default_point_shape)
+    local ok = insert_envelope_point(envelope, autoitem_idx, ins_t, v, shape_in, tension, false, false)
     if ok then
         sort_envelope_points(envelope, autoitem_idx)
         reaper.UpdateArrange()
@@ -771,7 +1462,7 @@ function M.refresh_captured_from_envelope(state, envelope, autoitem_idx)
     end
 end
 
---- Clear all point selection on the envelope, then select indices in `captured_points` (sculpt/nudge drag start).
+--- Clear all point selection on the envelope, then select indices in `captured_points` (nudge/sculpt drag start; not smooth).
 function M.sync_envelope_selection_to_captured(envelope, autoitem_idx, captured_points)
     if not envelope then return end
     local select_idx = {}

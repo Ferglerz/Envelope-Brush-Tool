@@ -121,10 +121,32 @@ local function curve_hit(state, deps, mx, my)
     return deps.point_hits_envelope_curve(state.target_envelope, mx, my)
 end
 
+local function update_envelope_hover_flags(state, deps, curve_on_curve)
+    if not state.target_envelope or not state.sws_hover_detected then
+        state.envelope_lane_hover = false
+        state.envelope_curve_hover = false
+        state.overlay_visible = false
+        return
+    end
+    local mx, my = deps.get_mouse_client_xy()
+    local in_lane = false
+    if mx ~= nil and my ~= nil then
+        local v_top, v_bottom = EnvApi.envelope_value_axis_screen_for_mapping(state, state.target_envelope)
+        if v_top ~= nil and v_bottom ~= nil and my >= v_top and my <= v_bottom then
+            in_lane = deps.is_envelope_lane_visible(state.target_envelope)
+        end
+    end
+    state.envelope_lane_hover = in_lane
+    state.envelope_curve_hover = in_lane and curve_on_curve == true
+    state.overlay_visible = in_lane
+end
+
 -- Hit-test REAPER envelope hover under mouse, update state accordingly
 function M.detect_envelope(state, deps)
     local freeze = state.is_dragging
     local mx, my = deps.get_mouse_client_xy()
+    state.envelope_lane_hover = false
+    state.envelope_curve_hover = false
 
     local function mouse_in_env_lane(env)
         if not env or mx == nil or my == nil then return false end
@@ -140,49 +162,88 @@ function M.detect_envelope(state, deps)
     -- Settings mode is pinned to the envelope captured on RMB open.
     if state.brush_settings_mode and state.target_envelope and state.brush_settings_freeze_client then
         state.sws_hover_detected = true
-        state.overlay_visible = true
-        return mouse_in_target_lane()
+        local in_lane = mouse_in_target_lane() and deps.is_envelope_lane_visible(state.target_envelope)
+        state.envelope_lane_hover = in_lane
+        state.envelope_curve_hover = false
+        state.overlay_visible = in_lane
+        return in_lane
     end
 
-    -- Keep active drag target stable; no reacquire while stroke is active.
+    -- Keep target envelope stable during stroke; still refresh lane/curve hover from live mouse.
     if freeze and state.target_envelope then
         state.sws_hover_detected = true
-        state.overlay_visible = true
-        return curve_hit(state, deps, mx, my)
+        local curve = curve_hit(state, deps, mx, my)
+        update_envelope_hover_flags(state, deps, curve)
+        return curve
     end
 
-    -- Fast path: while hovering same target lane, keep target without re-querying SWS.
-    if state.target_envelope and mouse_in_target_lane() and deps.is_envelope_lane_visible(state.target_envelope) then
+    -- Lanes with no automation items: parent lane only (ai=-1). Skip SWS while cursor stays in that lane.
+    if state.target_envelope
+        and not EnvApi.envelope_has_automation_items(state.target_envelope, state)
+        and mouse_in_target_lane()
+        and deps.is_envelope_lane_visible(state.target_envelope) then
+        state.envelope_autoitem_idx = -1
         state.sws_hover_detected = true
-        state.overlay_visible = true
-        return true
+        local curve = curve_hit(state, deps, mx, my)
+        update_envelope_hover_flags(state, deps, curve)
+        return curve
     end
 
-    local e = nil
+    -- Query SWS for envelope + automation item index (required when lane has AIs or acquiring a new target).
     local window, segment = reaper.BR_GetMouseCursorContext()
     local is_envelope_context = (window == "arrange" and segment == "envelope")
+    local e, ai_idx = nil, -1
     if is_envelope_context then
-        e = reaper.BR_GetMouseCursorContext_Envelope()
+        if reaper.BR_GetMouseCursorContext_EnvelopeEx then
+            local take_env
+            e, take_env, ai_idx = reaper.BR_GetMouseCursorContext_EnvelopeEx()
+            if e and take_env then
+                e = nil
+                ai_idx = -1
+            end
+        else
+            e = reaper.BR_GetMouseCursorContext_Envelope()
+            ai_idx = -1
+        end
+        if e and EnvApi.envelope_is_take_envelope(e) then
+            e = nil
+            ai_idx = -1
+        end
         if e and not mouse_in_env_lane(e) then
             e = nil
+            ai_idx = -1
         end
     end
     state.sws_hover_detected = (e ~= nil)
+
+    -- Stickiness only for no-AI lanes: marginal SWS miss must not preserve a stale ai_idx>=0 on AI lanes.
+    local keep_prev = false
+    if not e and state.target_envelope and mouse_in_target_lane() and deps.is_envelope_lane_visible(state.target_envelope) then
+        if not EnvApi.envelope_has_automation_items(state.target_envelope, state) then
+            keep_prev = true
+            state.envelope_autoitem_idx = -1
+            state.sws_hover_detected = true
+        end
+    end
 
     if state.target_envelope and not deps.is_envelope_lane_visible(state.target_envelope) then
         deps.clear_target_envelope_state_only()
     end
     if e then
-        if state.target_envelope ~= e then state.cached_envelope_properties.envelope = nil end
+        if state.target_envelope ~= e then
+            state.cached_envelope_properties.envelope = nil
+        end
         state.target_envelope = e
-        state.envelope_autoitem_idx = -1
+        state.envelope_autoitem_idx = (type(ai_idx) == "number" and ai_idx >= -1) and ai_idx or -1
+        EnvApi.envelope_has_automation_items(e, state)
         deps.setup_envelope_bounds()
-    else
+    elseif not keep_prev then
         deps.clear_target_envelope_state_only()
     end
 
-    state.overlay_visible = (state.sws_hover_detected and state.target_envelope ~= nil)
-    return curve_hit(state, deps, mx, my)
+    local curve = curve_hit(state, deps, mx, my)
+    update_envelope_hover_flags(state, deps, curve)
+    return curve
 end
 
 return M

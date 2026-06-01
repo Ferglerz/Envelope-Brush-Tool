@@ -10,7 +10,7 @@ function M.render_brush_hud(state, config, deps, hud, draw)
     local ctx = state.ctx
     if state._shutdown_complete or not ctx then return end
 
-    if not hud.brush_hud_visible(state) then
+    if not hud.brush_hud_rings_visible(state) then
         return
     end
 
@@ -58,21 +58,26 @@ function M.render_brush_hud(state, config, deps, hud, draw)
         local ring_px = min_px + (6 - 1)
         local dash_per_px = (2 * math.pi) / ring_px
         local dash_outer = math.max(2, math.floor(dash_per_px * radius + 0.5))
-        local inner_radius = deps.calc_inner_brush_radius(radius)
-        local dash_inner = math.max(2, math.floor(dash_per_px * inner_radius + 0.5))
+        local smooth_drag = state.is_dragging == true and state.active_sculpt_kind == "smooth"
 
         draw.draw_dashed_circle(draw_list, cx, cy, radius, hcfg.OUTER_CIRCLE_COLOR, hcfg.CIRCLE_THICKNESS, dash_outer)
-        draw.draw_dashed_circle(draw_list, cx, cy, inner_radius, hcfg.INNER_CIRCLE_COLOR, hcfg.CIRCLE_THICKNESS - 1, dash_inner)
+
+        if not smooth_drag then
+            local inner_radius = deps.calc_inner_brush_radius(radius)
+            local dash_inner = math.max(2, math.floor(dash_per_px * inner_radius + 0.5))
+            draw.draw_dashed_circle(draw_list, cx, cy, inner_radius, hcfg.INNER_CIRCLE_COLOR, hcfg.CIRCLE_THICKNESS - 1, dash_inner)
+        end
 
         if state.lock_time_axis or state.lock_value_axis then
             local suffix = state.lock_time_axis and " X" or " Y"
             local font_sz = reaper.ImGui_GetFontSize(ctx)
             local tx = cx - radius
             local ty = (cy + radius) - font_sz - 2 + (C.LOCK_ICON_OVERLAY_Y_OFFSET or 0)
+            local lock_ty = ty + (C.LOCK_ICON_OVERLAY_LOCK_Y_OFFSET or 0)
             local lf = state.font_lock_closed
             reaper.ImGui_PushFont(ctx, lf, font_sz)
             local tw1 = Style.calc_text_w(ctx, C.LOCK_GLYPH)
-            reaper.ImGui_DrawList_AddText(draw_list, tx, ty, 0xFFFFFFFF, C.LOCK_GLYPH)
+            reaper.ImGui_DrawList_AddText(draw_list, tx, lock_ty, 0xFFFFFFFF, C.LOCK_GLYPH)
             reaper.ImGui_PopFont(ctx)
             reaper.ImGui_DrawList_AddText(draw_list, tx + tw1 + 4, ty, 0xFFFFFFFF, suffix)
         end

@@ -127,18 +127,17 @@ local function falloff_combo(ctx, state, config, deps)
     reaper.ImGui_EndCombo(ctx)
 end
 
-local function axis_lock_chip_row(ctx, Style, chip_size, font_closed, font_open, locked, id_stem, axis_letter, tooltip)
-    local font_px = C.LOCK_ICON_CHIP_FONT_PX or math.max(10, chip_size - 10)
-    local font = locked and font_closed or font_open
-    local letter_gap = 6
+local CHECKMARK_CHIP_COLOR = 0xCCCCCCFF
 
-    local letter_tw, letter_th = reaper.ImGui_CalcTextSize(ctx, axis_letter)
-    if type(letter_tw) ~= "number" then
-        letter_tw, letter_th = select(1, letter_tw), select(2, letter_tw)
+local function settings_chip_label_row(ctx, Style, chip_size, selected, id_stem, right_label, tooltip, selected_palette, draw_chip)
+    local label_gap = 6
+    local label_tw, label_th = reaper.ImGui_CalcTextSize(ctx, right_label)
+    if type(label_tw) ~= "number" then
+        label_tw, label_th = select(1, label_tw), select(2, label_th)
     end
-    letter_th = letter_th or (reaper.ImGui_GetTextLineHeight and reaper.ImGui_GetTextLineHeight(ctx)) or chip_size
-    local row_h = math.max(chip_size, letter_th)
-    local group_w = chip_size + letter_gap + letter_tw
+    label_th = label_th or (reaper.ImGui_GetTextLineHeight and reaper.ImGui_GetTextLineHeight(ctx)) or chip_size
+    local row_h = chip_size
+    local group_w = chip_size + label_gap + label_tw
 
     if reaper.ImGui_BeginGroup then
         reaper.ImGui_BeginGroup(ctx)
@@ -154,25 +153,11 @@ local function axis_lock_chip_row(ctx, Style, chip_size, font_closed, font_open,
         reaper.ImGui_PushStyleVar(ctx, fp_id, 0, 0)
     end
 
-    reaper.ImGui_SetCursorPos(ctx, base_x, base_y + (row_h - chip_size) * 0.5)
-    reaper.ImGui_PushFont(ctx, font, font_px)
-    local clicked = Style.chip_button(ctx, "##lock" .. id_stem, locked, chip_size, chip_size)
-
-    local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
-    if draw_list then
-        local rx, ry = reaper.ImGui_GetItemRectMin(ctx)
-        if type(rx) == "number" and type(ry) == "number" then
-            local tw, th = reaper.ImGui_CalcTextSize(ctx, C.LOCK_GLYPH)
-            if type(tw) ~= "number" then
-                tw, th = select(1, tw), select(2, tw)
-            end
-            th = th or font_px
-            local tx = rx + (chip_size - tw) * 0.5
-            local ty = ry + (chip_size - th) * 0.5 + (C.LOCK_ICON_CHIP_Y_OFFSET or 0)
-            reaper.ImGui_DrawList_AddText(draw_list, tx, ty, 0xEEEEEEFF, C.LOCK_GLYPH)
-        end
+    reaper.ImGui_SetCursorPos(ctx, base_x, base_y)
+    local clicked = Style.chip_button(ctx, id_stem, selected, chip_size, chip_size, selected_palette)
+    if draw_chip then
+        draw_chip(ctx, chip_size)
     end
-    reaper.ImGui_PopFont(ctx)
 
     if fp_id then
         reaper.ImGui_PopStyleVar(ctx)
@@ -181,14 +166,96 @@ local function axis_lock_chip_row(ctx, Style, chip_size, font_closed, font_open,
         reaper.ImGui_SetTooltip(ctx, tooltip)
     end
 
-    reaper.ImGui_SetCursorPos(ctx, base_x + chip_size + letter_gap, base_y + (row_h - letter_th) * 0.5)
-    reaper.ImGui_Text(ctx, axis_letter)
+    reaper.ImGui_SetCursorPos(ctx, base_x + chip_size + label_gap, base_y + (row_h - label_th) * 0.5)
+    reaper.ImGui_Text(ctx, right_label)
     reaper.ImGui_Dummy(ctx, group_w, row_h)
 
     if reaper.ImGui_EndGroup then
         reaper.ImGui_EndGroup(ctx)
     end
     return clicked
+end
+
+local function axis_lock_chip_row(ctx, Style, chip_size, font_closed, font_open, locked, id_stem, axis_letter, tooltip, lock_font_px)
+    local font_px = lock_font_px or C.LOCK_ICON_CHIP_FONT_PX or math.max(10, chip_size - 10)
+    local font = locked and font_closed or font_open
+    local palette = locked and C.LOCK_CHIP_SELECTED or nil
+
+    local function draw_lock_chip(ctx, chip_size)
+        local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
+        if not draw_list then
+            return
+        end
+        local rx, ry = reaper.ImGui_GetItemRectMin(ctx)
+        if type(rx) ~= "number" or type(ry) ~= "number" then
+            return
+        end
+        reaper.ImGui_PushFont(ctx, font, font_px)
+        local tw, th = reaper.ImGui_CalcTextSize(ctx, C.LOCK_GLYPH)
+        if type(tw) ~= "number" then
+            tw, th = select(1, tw), select(2, tw)
+        end
+        th = th or font_px
+        local tx = rx + (chip_size - tw) * 0.5
+        local ty = ry + (chip_size - th) * 0.5 + (C.LOCK_ICON_CHIP_Y_OFFSET or 0)
+        reaper.ImGui_DrawList_AddText(draw_list, tx, ty, 0xEEEEEEFF, C.LOCK_GLYPH)
+        reaper.ImGui_PopFont(ctx)
+    end
+
+    return settings_chip_label_row(
+        ctx, Style, chip_size, locked, "##lock" .. id_stem, axis_letter, tooltip, palette, draw_lock_chip)
+end
+
+local function checkmark_chip_draw(Style, on)
+    return function(ctx, chip_sz)
+        if not on then
+            return
+        end
+        local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
+        if not draw_list then
+            return
+        end
+        local rx, ry = reaper.ImGui_GetItemRectMin(ctx)
+        if type(rx) ~= "number" or type(ry) ~= "number" then
+            return
+        end
+        local mark_sz = chip_sz * 0.55
+        local mx = rx + (chip_sz - mark_sz) * 0.5
+        local my = ry + (chip_sz - mark_sz) * 0.5
+        Style.draw_checkmark(draw_list, mx, my, mark_sz, CHECKMARK_CHIP_COLOR)
+    end
+end
+
+local function checkmark_chip_row(ctx, Style, chip_size, on, id_stem, right_label, tooltip)
+    return settings_chip_label_row(
+        ctx, Style, chip_size, false, id_stem, right_label, tooltip, nil, checkmark_chip_draw(Style, on))
+end
+
+local function invert_scroll_chip_row(ctx, Style, chip_size, on, tooltip)
+    return checkmark_chip_row(ctx, Style, chip_size, on, "##invert_scroll", "Invert Scroll", tooltip)
+end
+
+local function cleanup_toggle_chip_row(ctx, Style, chip_size, on, id_stem, right_label, tooltip)
+    return checkmark_chip_row(ctx, Style, chip_size, on, id_stem, right_label, tooltip)
+end
+
+local function hud_row_gap(ctx, gap)
+    if gap and gap > 0 then
+        reaper.ImGui_Dummy(ctx, 0, gap)
+    end
+end
+
+local function hud_panel_has_content(state)
+    if state.brush_settings_mode then
+        return true
+    end
+    if state.hud_info_enabled ~= false then
+        return true
+    end
+    if state.hud_hints_enabled ~= false then
+        return true
+    end
+    return false
 end
 
 --- One window: HUD readout (mode, falloff as text or combo, stats, hints) + optional settings (RMB). Aligns with brush; no second window gap.
@@ -198,6 +265,9 @@ function M.render_brush_hud_panel(state, config, deps, hud)
         return
     end
     if not hud.brush_hud_visible(state) then
+        return
+    end
+    if not hud_panel_has_content(state) then
         return
     end
 
@@ -241,7 +311,12 @@ function M.render_brush_hud_panel(state, config, deps, hud)
     local col_gap = 10
     local panel_inner_w = col_w * 2 + col_gap
 
-    local layout_pushed = Style.push_settings_layout(ctx)
+    local hcfg = config.hud or {}
+    local row_gap = hcfg.HUD_TEXT_ROW_GAP or 3
+    local font_delta = hcfg.HUD_FONT_SIZE_DELTA or 1
+    local hint_col = hcfg.HUD_HINT_TEXT_COLOR or 0xFFFFFF99
+
+    local layout_pushed = Style.push_settings_layout(ctx, row_gap)
     local visible = reaper.ImGui_Begin(ctx, "##BrushHudPanel", nil, flags)
     if not visible then
         reaper.ImGui_End(ctx)
@@ -251,6 +326,7 @@ function M.render_brush_hud_panel(state, config, deps, hud)
 
     local display_alpha = state.brush_settings_mode and 1 or alpha
     local alpha_pushed = Style.push_style_alpha(ctx, display_alpha)
+    local font_pushed = Style.push_hud_font(ctx, font_delta)
 
     local rel_base = reaper.ImGui_GetCursorPosX(ctx)
     local settings_grey_n = 0
@@ -259,14 +335,20 @@ function M.render_brush_hud_panel(state, config, deps, hud)
     local ft_key = fcfg.FALLOFF_TYPES[state.falloff_type]
     local falloff_pretty = (fcfg.FALLOFF_TYPE_LABELS and fcfg.FALLOFF_TYPE_LABELS[ft_key]) or ft_key
 
-    local mode_label = deps.brush_drag_kind_display and deps.brush_drag_kind_display() or "—"
-    reaper.ImGui_Text(ctx, mode_label)
+    local show_info = state.hud_info_enabled ~= false
 
     if state.brush_settings_mode then
+        local drag_key = deps.brush_drag_kind_key and deps.brush_drag_kind_key() or nil
+        if drag_key and drag_key ~= "smooth" then
+            local mode_label = deps.brush_drag_kind_display and deps.brush_drag_kind_display() or "—"
+            reaper.ImGui_Text(ctx, mode_label)
+            reaper.ImGui_SameLine(ctx, 0, 6)
+        end
         settings_grey_n = Style.push_settings_grey_style(ctx)
         falloff_combo(ctx, state, config, deps)
-    else
-        reaper.ImGui_Text(ctx, falloff_pretty)
+    elseif show_info then
+        local header = (deps.brush_mode_falloff_header and deps.brush_mode_falloff_header(falloff_pretty)) or falloff_pretty
+        reaper.ImGui_Text(ctx, header)
     end
 
     local size_txt = string.format("Size: %d", state.brush_size)
@@ -274,63 +356,92 @@ function M.render_brush_hud_panel(state, config, deps, hud)
     local fall_txt = string.format("Falloff: %.1f%%", fall_pct)
     local pow_pct = deps.sculpt_power_percent(state.sculpt_power)
     local pow_txt = string.format("Power: %.1f%%", pow_pct)
-    local gap = "   "
-    reaper.ImGui_Text(ctx, size_txt .. gap .. fall_txt .. gap .. pow_txt)
+    local stat_gap = "   "
 
-    if not state.brush_settings_mode then
-        local font_sz = reaper.ImGui_GetFontSize(ctx)
-        local w_size_gap = Style.calc_text_w(ctx, size_txt .. gap)
-        local w_fall_gap = Style.calc_text_w(ctx, fall_txt .. gap)
+    if show_info then
+        hud_row_gap(ctx, row_gap)
+        reaper.ImGui_Text(ctx, size_txt .. stat_gap .. fall_txt .. stat_gap .. pow_txt)
+    end
+
+    if not state.brush_settings_mode and state.hud_hints_enabled ~= false then
         local mod_wheel = (deps.primary_modifier_short_name and deps.primary_modifier_short_name() or "Ctrl") .. " + scroll"
-        local row_y = reaper.ImGui_GetCursorPosY(ctx) + 2
 
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0x888888FF)
-        reaper.ImGui_SetCursorPos(ctx, rel_base, row_y)
-        reaper.ImGui_Text(ctx, "Scroll")
-        reaper.ImGui_SetCursorPos(ctx, rel_base + w_size_gap, row_y)
-        reaper.ImGui_Text(ctx, "Alt + scroll")
-        reaper.ImGui_SetCursorPos(ctx, rel_base + w_size_gap + w_fall_gap, row_y)
-        reaper.ImGui_Text(ctx, mod_wheel)
-        reaper.ImGui_SetCursorPos(ctx, rel_base, row_y + font_sz + 2)
-        reaper.ImGui_Text(ctx, "Shift: fine (25%)")
+        hud_row_gap(ctx, row_gap)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), hint_col)
+        if show_info then
+            local w_size_gap = Style.calc_text_w(ctx, size_txt .. stat_gap)
+            local w_fall_gap = Style.calc_text_w(ctx, fall_txt .. stat_gap)
+            reaper.ImGui_Text(ctx, "Scroll")
+            reaper.ImGui_SameLine(ctx, 0, 0)
+            reaper.ImGui_SetCursorPosX(ctx, rel_base + w_size_gap)
+            reaper.ImGui_Text(ctx, "Alt + scroll")
+            reaper.ImGui_SameLine(ctx, 0, 0)
+            reaper.ImGui_SetCursorPosX(ctx, rel_base + w_size_gap + w_fall_gap)
+            reaper.ImGui_Text(ctx, mod_wheel)
+        else
+            reaper.ImGui_Text(ctx, "Scroll")
+            reaper.ImGui_SameLine(ctx, 0, 8)
+            reaper.ImGui_Text(ctx, "Alt + scroll")
+            reaper.ImGui_SameLine(ctx, 0, 8)
+            reaper.ImGui_Text(ctx, mod_wheel)
+        end
+
+        hud_row_gap(ctx, row_gap)
+        reaper.ImGui_SetCursorPosX(ctx, rel_base)
+        reaper.ImGui_Text(ctx, "Shift: Smooth")
+
+        hud_row_gap(ctx, row_gap)
+        reaper.ImGui_SetCursorPosX(ctx, rel_base)
+        reaper.ImGui_Text(ctx, "Shift + scroll: Density")
+
+        hud_row_gap(ctx, row_gap)
+        reaper.ImGui_SetCursorPosX(ctx, rel_base)
+        reaper.ImGui_Text(ctx, "Settings: Right Click")
         reaper.ImGui_PopStyleColor(ctx, 1)
     end
 
     if state.brush_settings_mode then
-        reaper.ImGui_Dummy(ctx, 0, 3)
+        hud_row_gap(ctx, row_gap)
 
         local chip_size = 28
+        local lock_chip_font_px = (C.LOCK_ICON_CHIP_FONT_PX or math.max(10, chip_size - 10)) + font_delta
         local fc, fo = state.font_lock_closed, state.font_lock_open
-        if axis_lock_chip_row(ctx, Style, chip_size, fc, fo, state.lock_time_axis, "lx", "X", "Lock time (horizontal). X key toggles.") then
+        if axis_lock_chip_row(ctx, Style, chip_size, fc, fo, state.lock_time_axis, "lx", "X", "Lock time (horizontal). X key toggles.", lock_chip_font_px) then
             state.lock_time_axis = not state.lock_time_axis
             if state.lock_time_axis then
                 state.lock_value_axis = false
             end
         end
         reaper.ImGui_SameLine(ctx, 0, 10)
-        if axis_lock_chip_row(ctx, Style, chip_size, fc, fo, state.lock_value_axis, "ly", "Y", "Lock value (vertical). Y key toggles.") then
+        if axis_lock_chip_row(ctx, Style, chip_size, fc, fo, state.lock_value_axis, "ly", "Y", "Lock value (vertical). Y key toggles.", lock_chip_font_px) then
             state.lock_value_axis = not state.lock_value_axis
             if state.lock_value_axis then
                 state.lock_time_axis = false
             end
         end
-        reaper.ImGui_SameLine(ctx, 0, 10)
-        if reaper.ImGui_AlignTextToFramePadding then
-            reaper.ImGui_AlignTextToFramePadding(ctx)
-        end
-        local inv_v = state.invert_brush_size_scroll and true or false
-        local inv_chg, inv_on = reaper.ImGui_Checkbox(ctx, "Invert brush size scroll", inv_v)
-        if inv_chg then
-            state.invert_brush_size_scroll = inv_on
+
+        hud_row_gap(ctx, row_gap)
+        if invert_scroll_chip_row(ctx, Style, chip_size, state.invert_scroll,
+            "When on, scroll direction for size, falloff (Alt+scroll), and min density (Shift+scroll) matches the older mapping.") then
+            state.invert_scroll = not state.invert_scroll
             if deps.clear_wheel_momentum then
                 deps.clear_wheel_momentum(state)
             end
         end
-        if reaper.ImGui_IsItemHovered and reaper.ImGui_IsItemHovered(ctx) and reaper.ImGui_SetTooltip then
-            reaper.ImGui_SetTooltip(ctx, "When on, scroll direction for brush size matches the older (opposite) mapping.")
+        reaper.ImGui_SameLine(ctx, 0, 10)
+        if checkmark_chip_row(ctx, Style, chip_size, state.hud_hints_enabled ~= false,
+            "##hud_hints", "Hints",
+            "When on, show shortcut hint lines on the brush HUD (scroll, Shift smooth/density, settings).") then
+            state.hud_hints_enabled = not state.hud_hints_enabled
+        end
+        reaper.ImGui_SameLine(ctx, 0, 10)
+        if checkmark_chip_row(ctx, Style, chip_size, state.hud_info_enabled ~= false,
+            "##hud_info", "Info",
+            "When on, show mode header and Size / Falloff / Power on the brush HUD.") then
+            state.hud_info_enabled = not state.hud_info_enabled
         end
 
-        reaper.ImGui_Dummy(ctx, 0, 3)
+        hud_row_gap(ctx, row_gap)
 
         local spcfg = config.spacing
         reaper.ImGui_Text(ctx, "Min density (pixels, new points)")
@@ -339,6 +450,47 @@ function M.render_brush_hud_panel(state, config, deps, hud)
         local sp_changed, new_sp = reaper.ImGui_SliderInt(ctx, "##mindens", state.min_point_spacing_px, sp_min, sp_max)
         if sp_changed then
             state.min_point_spacing_px = math.max(1, math.max(sp_min, math.min(sp_max, new_sp)))
+        end
+        if state.hud_hints_enabled ~= false then
+            hud_row_gap(ctx, row_gap)
+            reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), hint_col)
+            reaper.ImGui_Text(ctx, "Shift + scroll")
+            reaper.ImGui_PopStyleColor(ctx, 1)
+        end
+
+        hud_row_gap(ctx, row_gap)
+        reaper.ImGui_Text(ctx, "Smooth Cleanup:")
+        hud_row_gap(ctx, row_gap)
+        if cleanup_toggle_chip_row(ctx, Style, chip_size, state.smooth_cleanup_bezier_enabled ~= false,
+            "##smooth_cleanup_bezier", "Bezier merge",
+            "After Shift+smooth drag: merge points into bezier spans (twice, with angle pass between).") then
+            state.smooth_cleanup_bezier_enabled = not state.smooth_cleanup_bezier_enabled
+        end
+        reaper.ImGui_SameLine(ctx, 0, 14)
+        if cleanup_toggle_chip_row(ctx, Style, chip_size, state.smooth_cleanup_angle_enabled ~= false,
+            "##smooth_cleanup_angle", "Angle cleanup",
+            "After bezier merge: remove stroke points nearly collinear on screen.") then
+            state.smooth_cleanup_angle_enabled = not state.smooth_cleanup_angle_enabled
+        end
+        if state.smooth_cleanup_bezier_enabled ~= false then
+            hud_row_gap(ctx, row_gap)
+            local ccfg = config.cleanup
+            local tol_min = ccfg.BEZIER_FIT_TOLERANCE_MIN or 0.001
+            local tol_max = ccfg.BEZIER_FIT_TOLERANCE_MAX or 0.05
+            reaper.ImGui_Text(ctx, "Bezier fit tolerance (value)")
+            reaper.ImGui_SetNextItemWidth(ctx, panel_inner_w)
+            local tol_changed, new_tol = reaper.ImGui_SliderDouble(
+                ctx, "##smooth_bezier_tol", state.smooth_bezier_fit_tolerance, tol_min, tol_max, "%.4f"
+            )
+            if tol_changed and type(new_tol) == "number" then
+                state.smooth_bezier_fit_tolerance = math.max(tol_min, math.min(tol_max, new_tol))
+            end
+            if state.hud_hints_enabled ~= false then
+                hud_row_gap(ctx, row_gap)
+                reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), hint_col)
+                reaper.ImGui_Text(ctx, "Lower = stricter fit · higher = more merging")
+                reaper.ImGui_PopStyleColor(ctx, 1)
+            end
         end
 
         if settings_grey_n > 0 then
@@ -356,10 +508,11 @@ function M.render_brush_hud_panel(state, config, deps, hud)
         end
     end
 
-    reaper.ImGui_End(ctx)
+    Style.pop_hud_font(ctx, font_pushed)
     if alpha_pushed > 0 then
         reaper.ImGui_PopStyleVar(ctx, alpha_pushed)
     end
+    reaper.ImGui_End(ctx)
     Style.pop_style_vars(ctx, layout_pushed)
 end
 
