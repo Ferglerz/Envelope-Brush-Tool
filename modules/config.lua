@@ -4,7 +4,6 @@ return {
     --- Arrange view, SWS hover, and defer/insert integration
     arrange = {
         DEFER_ENVELOPE_SUPPRESS_CONTROL_IMGUI = false, -- Suppress ImGui window after envelope flush (avoids flicker)
-        INSERT_AT_MOUSE_ACTION_ID = 0, -- 0: insert at mapped coords, >0: use OS cursor action
         ARRANGE_RULER_INSET = 28, -- Arrange view top padding (exclude ruler)
         ENVELOPE_HOVER_TOLERANCE_PIXELS = 8, -- Pixel proximity for curve hover UI (not for brush ops)
     },
@@ -42,9 +41,10 @@ return {
         DEFAULT_FALLOFF_STRENGTH = 1.0,
         MIN_FALLOFF_STRENGTH = 0.1,
         MAX_FALLOFF_STRENGTH = 3.0,
-        FALLOFF_STRENGTH_STEP = 0.1,
-        FALLOFF_INNER_RATIO_AT_MIN_STRENGTH = 0.88, -- Dashed inner ring at min strength (fraction of brush radius)
-        FALLOFF_INNER_RATIO_AT_MAX_STRENGTH = 0.12, -- ...at max strength
+        --- Alt+scroll: 1 display-% per tick (0.01 underlying; Shift uses wheel fine 25%).
+        FALLOFF_STRENGTH_PERCENT_STEP = 1,
+        --- Inner dashed ring = brush radius where spatial falloff weight drops to this (0..1).
+        FALLOFF_INNER_WEIGHT_THRESHOLD = 0.5,
     },
 
     --- Min screen gap when seeding new envelope points (not used for deletion).
@@ -74,7 +74,8 @@ return {
         DEFAULT_SCULPT_POWER = 1.0,
         MIN_SCULPT_POWER = 0.25,
         MAX_SCULPT_POWER = 4.0,
-        SCULPT_POWER_STEP = 0.05,
+        --- Cmd/Ctrl+scroll: 1 display-% per tick (0.01 underlying; Shift uses wheel fine 25%).
+        SCULPT_POWER_PERCENT_STEP = 1,
     },
 
     --- Arrange overlay: brush rings, HUD text fade, padding hints

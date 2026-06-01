@@ -1,8 +1,8 @@
 local M = {}
 
-local SCRIPT_PATH = debug.getinfo(1, "S").source:match("^@(.+)$") or ""
-local SCRIPT_DIR = SCRIPT_PATH:match("^(.*[\\/])") or ""
-local Mods = dofile(SCRIPT_DIR .. "mods.lua")
+local _mod_dir = (((debug.getinfo(1, "S").source or ""):match("^@(.+)$")) or ""):match("^(.*[\\/])") or ""
+local Path = dofile(_mod_dir .. "path.lua")
+local Mods = Path.load_from_modules("mods.lua")
 
 local function shift_fine_active()
     return reaper.JS_Mouse_GetState and (reaper.JS_Mouse_GetState(Mods.JS_SHIFT) or 0) > 0
@@ -21,7 +21,7 @@ function M.new(state, config, modules)
     deps.get_envelope_properties = function(target_envelope) return core.get_envelope_properties(state, target_envelope) end
     deps.envelope_value_at_time = function(env, t) return core.envelope_value_at_time(env, t) end
     deps.envelope_value_for_insert = function(env, t)
-        return core.envelope_value_for_insert(env, t, state.envelope_autoitem_idx or -1)
+        return core.envelope_value_for_insert(env, t, core.track_autoitem_idx(state))
     end
 
     deps.screen_to_envelope = function(x, y, env)
@@ -43,7 +43,7 @@ function M.new(state, config, modules)
     deps.insert_one_point_at_arrange_client = function(mx, my)
         local env = state.target_envelope
         if not env or mx == nil or my == nil then return false end
-        local ai = state.envelope_autoitem_idx or -1
+        local ai = core.track_autoitem_idx(state)
         core.prepare_envelope_for_point_insert(env, state)
         local ok = ops.insert_one_point_at_screen(
             env, ai, mx, my,
@@ -55,7 +55,7 @@ function M.new(state, config, modules)
     end
 
     deps.create_points_in_brush_area = function(mx, my, radius, env)
-        local ai = state.envelope_autoitem_idx or -1
+        local ai = core.track_autoitem_idx(state)
         return ops.create_points_in_brush_area(
             state, config, mx, my, radius, env, ai,
             deps.screen_to_envelope, deps.envelope_to_screen, core.get_distance,
@@ -95,9 +95,10 @@ function M.new(state, config, modules)
         end
         local cache = state.seed_hover_cache
         local age = (cache and cache.built_os) and (now - cache.built_os) or math.huge
+        local ai = core.track_autoitem_idx(state)
         local same_env = cache
             and cache.envelope == env
-            and (cache.autoitem_idx or -1) == (state.envelope_autoitem_idx or -1)
+            and (cache.autoitem_idx or -1) == ai
             and math.abs((cache.brush_size or 0) - (state.brush_size or 0)) <= 1e-9
         if not moved and same_env and age < min_iv then
             return false
@@ -109,7 +110,7 @@ function M.new(state, config, modules)
             my,
             state.brush_size,
             env,
-            state.envelope_autoitem_idx or -1,
+            ai,
             deps.screen_to_envelope,
             deps.envelope_to_screen,
             deps.get_envelope_properties,
@@ -120,7 +121,7 @@ function M.new(state, config, modules)
     end
 
     deps.capture_points_in_radius = function(mx, my, radius, env)
-        local ai = state.envelope_autoitem_idx or -1
+        local ai = core.track_autoitem_idx(state)
         return ops.capture_points_in_radius(
             state, config, mx, my, radius, env, ai,
             deps.envelope_to_screen, core.get_distance, core.calculate_falloff
@@ -128,7 +129,7 @@ function M.new(state, config, modules)
     end
 
     deps.sculpt_captured_points = function(points, dx, dy, env)
-        local ai = state.envelope_autoitem_idx or -1
+        local ai = core.track_autoitem_idx(state)
         return ops.sculpt_captured_points(
             state, config, points, dx, dy, env, ai,
             deps.get_envelope_properties, core.clamp, core.envelope_value_at_time,
@@ -137,17 +138,25 @@ function M.new(state, config, modules)
     end
 
     deps.refresh_captured_from_envelope = function(env)
-        local ai = state.envelope_autoitem_idx or -1
+        local ai = core.track_autoitem_idx(state)
         return ops.refresh_captured_from_envelope(state, env, ai)
     end
 
     deps.sync_brush_point_selection = function(env, captured_points)
-        local ai = state.envelope_autoitem_idx or -1
+        local ai = core.track_autoitem_idx(state)
         return ops.sync_envelope_selection_to_captured(env, ai, captured_points)
     end
 
     deps.calc_inner_brush_radius = function(outer_radius)
         return core.calc_inner_brush_radius(state, config, outer_radius)
+    end
+
+    deps.falloff_strength_percent = function(strength)
+        return core.falloff_strength_percent(strength, config)
+    end
+
+    deps.sculpt_power_percent = function(power)
+        return core.sculpt_power_percent(power, config)
     end
 
     deps.primary_modifier_short_name = core.primary_modifier_short_name
@@ -173,7 +182,7 @@ function M.new(state, config, modules)
         ops.remove_redundant_envelope_points_by_angle(
             config,
             state.target_envelope,
-            state.envelope_autoitem_idx or -1,
+            core.track_autoitem_idx(state),
             deps.envelope_to_screen,
             nil
         )

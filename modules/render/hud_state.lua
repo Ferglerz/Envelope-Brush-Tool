@@ -15,10 +15,9 @@ function M.brush_hud_visible(state)
     return state.brush_settings_mode == true and state.brush_settings_freeze_client ~= nil
 end
 
---- ImGui (x,y) at brush center: frozen arrange client in settings mode, else live mouse.
---- Client coords from JS_Window_ScreenToClient; draw via ClientToScreen + PointConvertNative (matches capture radial math).
+--- ImGui (x,y) at brush center: frozen arrange client in settings mode, else live mouse via arrange client → ImGui.
 function M.brush_center_imgui_xy(state, deps)
-    if not deps then
+    if not deps or not deps.arrange_client_to_imgui then
         return nil, nil
     end
     if state.brush_settings_mode and state.brush_settings_freeze_client then
@@ -27,21 +26,18 @@ function M.brush_center_imgui_xy(state, deps)
             state.brush_settings_freeze_client.y
         )
     end
-    if deps.get_mouse_client_xy and deps.arrange_client_to_imgui then
-        local cx, cy = deps.get_mouse_client_xy()
-        if cx and cy then
-            if deps.brush_center_client_xy then
-                cx, cy = deps.brush_center_client_xy(cx, cy)
-            end
-            if cx and cy then
-                return deps.arrange_client_to_imgui(cx, cy)
-            end
-        end
+    if not deps.get_mouse_client_xy or not deps.brush_center_client_xy then
+        return nil, nil
     end
-    if deps.get_mouse_imgui_xy then
-        return deps.get_mouse_imgui_xy()
+    local cx, cy = deps.get_mouse_client_xy()
+    if cx == nil or cy == nil then
+        return nil, nil
     end
-    return nil, nil
+    cx, cy = deps.brush_center_client_xy(cx, cy)
+    if cx == nil or cy == nil then
+        return nil, nil
+    end
+    return deps.arrange_client_to_imgui(cx, cy)
 end
 
 --- While envelope hover HUD is relevant: LMB hides text quickly; release fades in over hud.BRUSH_HUD_TEXT_FADE_IN_SEC.

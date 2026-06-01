@@ -1,10 +1,21 @@
 local M = {}
 
-local function style_var_frame_rounding()
-    local f = reaper.ImGuiStyleVar_FrameRounding
-    if f == nil then return nil end
-    if type(f) == "function" then return f() end
-    return f
+--- ReaImGui enum: function() or constant; nil → 0.
+function M.flag(fn)
+    if fn == nil then return 0 end
+    return type(fn) == "function" and fn() or fn
+end
+
+function M.cond_always()
+    return M.flag(reaper.ImGui_Cond_Always)
+end
+
+function M.flags_or(...)
+    local flags = 0
+    for i = 1, select("#", ...) do
+        flags = flags | M.flag(select(i, ...))
+    end
+    return flags
 end
 
 --- Tight layout: match draw-list HUD column (no window padding), reduce frame/item gaps so widgets align with plain text.
@@ -12,7 +23,7 @@ function M.push_settings_layout(ctx)
     local n = 0
     local function push2(var, a, b)
         if var == nil then return end
-        local id = type(var) == "function" and var() or var
+        local id = M.flag(var)
         reaper.ImGui_PushStyleVar(ctx, id, a, b)
         n = n + 1
     end
@@ -68,38 +79,39 @@ function M.push_settings_grey_style(ctx)
     return n
 end
 
---- Grey chip button; colors 0xRRGGBBAA for ReaImGui PushStyleColor.
+--- Grey chip button (draw-list rounded rect; ReaImGui FrameRounding push is unreliable here).
 function M.chip_button(ctx, label, selected, w, h)
-    local svr = style_var_frame_rounding()
-    if svr ~= nil then
-        reaper.ImGui_PushStyleVar(ctx, svr, 10)
+    if not reaper.ImGui_InvisibleButton then
+        return false
     end
-    local cb = reaper.ImGui_Col_Button()
-    local ch = reaper.ImGui_Col_ButtonHovered()
-    local ca = reaper.ImGui_Col_ButtonActive()
-    local pushed = 3
-    if selected then
-        reaper.ImGui_PushStyleColor(ctx, cb, 0x505050FF)
-        reaper.ImGui_PushStyleColor(ctx, ch, 0x5E5E5EFF)
-        reaper.ImGui_PushStyleColor(ctx, ca, 0x454545FF)
+    reaper.ImGui_InvisibleButton(ctx, label, w, h)
+    local hovered = reaper.ImGui_IsItemHovered(ctx)
+    local active = reaper.ImGui_IsItemActive(ctx)
+    local clicked = reaper.ImGui_IsItemClicked(ctx)
+    local col
+    if active then
+        col = selected and 0x454545FF or 0x303030FF
+    elseif hovered then
+        col = selected and 0x5E5E5EFF or 0x484848FF
     else
-        reaper.ImGui_PushStyleColor(ctx, cb, 0x3A3A3AFF)
-        reaper.ImGui_PushStyleColor(ctx, ch, 0x484848FF)
-        reaper.ImGui_PushStyleColor(ctx, ca, 0x303030FF)
+        col = selected and 0x505050FF or 0x3A3A3AFF
     end
-    local clicked = reaper.ImGui_Button(ctx, label, w, h)
-    if pushed > 0 then
-        reaper.ImGui_PopStyleColor(ctx, pushed)
-    end
-    if svr ~= nil then
-        reaper.ImGui_PopStyleVar(ctx)
+    local rounding = math.min(w, h) * 0.5
+    local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
+    if draw_list then
+        local x1, y1 = reaper.ImGui_GetItemRectMin(ctx)
+        local x2, y2 = reaper.ImGui_GetItemRectMax(ctx)
+        if type(x1) == "number" and type(y1) == "number" and type(x2) == "number" and type(y2) == "number" then
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, x1, y1, x2, y2, col, rounding)
+        end
     end
     return clicked
 end
 
 function M.calc_text_w(ctx, s)
     local tw = reaper.ImGui_CalcTextSize(ctx, s)
-    return type(tw) == "number" and tw or (select(1, tw) or 0)
+    if type(tw) == "number" then return tw end
+    return select(1, tw) or 0
 end
 
 function M.push_style_alpha(ctx, a)
@@ -107,7 +119,7 @@ function M.push_style_alpha(ctx, a)
     if v == nil then
         return 0
     end
-    local id = type(v) == "function" and v() or v
+    local id = M.flag(v)
     reaper.ImGui_PushStyleVar(ctx, id, a)
     return 1
 end

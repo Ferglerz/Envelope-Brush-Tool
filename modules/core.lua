@@ -1,9 +1,9 @@
-local SCRIPT_PATH = debug.getinfo(1, "S").source:match("^@(.+)$") or ""
-local SCRIPT_DIR = SCRIPT_PATH:match("^(.*[\\/])") or ""
-
-local CONFIG = dofile(SCRIPT_DIR .. "config.lua")
-local EnvApi = dofile(SCRIPT_DIR .. "envelope/envelope_api.lua")
-local ArrangeMsg = dofile(SCRIPT_DIR .. "arrange_messages.lua")
+local _mod_dir = (((debug.getinfo(1, "S").source or ""):match("^@(.+)$")) or ""):match("^(.*[\\/])") or ""
+local Path = dofile(_mod_dir .. "path.lua")
+local Util = Path.load_from_modules("util.lua")
+local CONFIG = Path.load_from_modules("config.lua")
+local EnvApi = Path.load_from_modules("envelope/envelope_api.lua")
+local ArrangeMsg = Path.load_from_modules("arrange_messages.lua")
 
 local M = {}
 M.CONFIG = CONFIG
@@ -46,8 +46,6 @@ function M.new_state(config)
         envelope_autoitem_idx = -1,
         envelope_bounds = {top = 150, bottom = 600, left = 200, right = 1200},
         overlay_visible = false,
-        cached_envelope = nil,
-        envelope_detected = false,
         sws_hover_detected = false,
 
         -- Cached envelope properties
@@ -127,9 +125,6 @@ function M.new_state(config)
         wheel_momentum_vel = 0,
         wheel_mom_size_accum = 0,
 
-        -- Prepare-once cache for insert path (track select + BR_Env arm/commit).
-        prepared_insert_envelope = nil,
-
         -- Hover-time seed warm cache: prebuilt point-distance list reused on first sculpt click.
         seed_hover_cache = nil,
         seed_hover_last_client = nil,
@@ -142,7 +137,11 @@ function M.get_distance(x1, y1, x2, y2)
 end
 
 function M.clamp(value, min_val, max_val)
-    return math.max(min_val, math.min(max_val, value))
+    return Util.clamp(value, min_val, max_val)
+end
+
+function M.track_autoitem_idx(state)
+    return Util.track_autoitem_idx(state)
 end
 
 --- While sculpt_sort_pending: sort at most every ENVELOPE_SORT_INTERVAL_SEC.
@@ -159,7 +158,7 @@ function M.tick_throttled_envelope_sort_if_due(state, config, ops)
         return false
     end
     if ops and ops.sort_envelope_points_for_autoitem then
-        ops.sort_envelope_points_for_autoitem(state.target_envelope, state.envelope_autoitem_idx or -1)
+        ops.sort_envelope_points_for_autoitem(state.target_envelope, M.track_autoitem_idx(state))
     end
     state.last_envelope_sort_os = now
     state.envelope_points_dirty_sort = false
@@ -167,15 +166,67 @@ function M.tick_throttled_envelope_sort_if_due(state, config, ops)
     return true
 end
 
-function M.calc_inner_brush_radius(state, config, outer_radius)
+function M.falloff_strength_percent(strength, _config)
+    return 100 * (strength or 0)
+end
+
+function M.clamp_falloff_strength(strength, config)
     local f = config.falloff
-    local span = f.MAX_FALLOFF_STRENGTH - f.MIN_FALLOFF_STRENGTH
-    local t = span > 1e-9 and (state.falloff_strength - f.MIN_FALLOFF_STRENGTH) / span or 0.5
-    t = M.clamp(t, 0, 1)
-    local rmin = f.FALLOFF_INNER_RATIO_AT_MAX_STRENGTH
-    local rmax = f.FALLOFF_INNER_RATIO_AT_MIN_STRENGTH
-    local ratio = rmax - t * (rmax - rmin)
-    return outer_radius * ratio
+    return M.clamp(strength, f.MIN_FALLOFF_STRENGTH, f.MAX_FALLOFF_STRENGTH)
+end
+
+function M.falloff_wheel_step(config, fine_mul)
+    local f = config.falloff
+    local pct = f.FALLOFF_STRENGTH_PERCENT_STEP or 1
+    fine_mul = fine_mul or 1
+    return (pct / 100) * fine_mul
+end
+
+function M.sculpt_power_percent(power, _config)
+    return 100 * (power or 0)
+end
+
+function M.clamp_sculpt_power(power, config)
+    local s = config.sculpt
+    return M.clamp(power, s.MIN_SCULPT_POWER, s.MAX_SCULPT_POWER)
+end
+
+function M.sculpt_wheel_step(config, fine_mul)
+    local s = config.sculpt
+    local pct = s.SCULPT_POWER_PERCENT_STEP or 1
+    fine_mul = fine_mul or 1
+    return (pct / 100) * fine_mul
+end
+
+--- Radius of dashed inner ring: largest distance from center where falloff weight >= threshold.
+function M.calc_inner_brush_radius(state, config, outer_radius)
+    if not outer_radius or outer_radius <= 0 then return 0 end
+    local f = config.falloff
+    local types = f.FALLOFF_TYPES
+    local idx = state.falloff_type or 1
+    if idx < 1 or idx > #types then idx = 1 end
+    local falloff_name = types[idx]
+    local strength = state.falloff_strength
+    local threshold = f.FALLOFF_INNER_WEIGHT_THRESHOLD or 0.5
+    threshold = M.clamp(threshold, 1e-6, 1 - 1e-6)
+
+    if M.calculate_falloff(0, outer_radius, falloff_name, strength) < threshold then
+        return 0
+    end
+    if M.calculate_falloff(outer_radius, outer_radius, falloff_name, strength) >= threshold then
+        return outer_radius
+    end
+
+    local lo, hi = 0.0, 1.0
+    for _ = 1, 24 do
+        local mid = (lo + hi) * 0.5
+        if M.calculate_falloff(mid * outer_radius, outer_radius, falloff_name, strength) >= threshold then
+            lo = mid
+        else
+            hi = mid
+        end
+    end
+    return outer_radius * lo
 end
 
 function M.refresh_frame_arrange(state)
@@ -298,39 +349,44 @@ function M.primary_modifier_short_name()
     return "Ctrl"
 end
 
-function M.calculate_falloff(distance, radius, falloff_type_name, strength)
-    if distance > radius then return 0 end
-    local normalized = radius > 1e-12 and (distance / radius) or 0
-
-    if falloff_type_name == "exponential" then
+local FALLOFF_CURVES = {
+    exponential = function(normalized, strength)
         return math.exp(-strength * 3 * normalized)
-    elseif falloff_type_name == "linear" then
-        -- Cap center weight at 1; strength still steepens the falloff toward the edge (cf. exponential modes).
+    end,
+    linear = function(normalized, strength)
         return math.min(1, (1 - normalized) * strength)
-    elseif falloff_type_name == "inverse_exponential" then
-        return (1 - math.exp(-strength * 3 * (1 - normalized)))
-    elseif falloff_type_name == "smoothstep" then
-        -- 3u² − 2u³ on (1 − t): flat center / flat edge, steep mid transition; strength scales like linear.
+    end,
+    inverse_exponential = function(normalized, strength)
+        return 1 - math.exp(-strength * 3 * (1 - normalized))
+    end,
+    smoothstep = function(normalized, strength)
         local u = 1 - normalized
         if u <= 0 then return 0 end
         if u >= 1 then u = 1 end
         local w = u * u * (3 - 2 * u)
         return math.min(1, w * strength)
-    elseif falloff_type_name == "circle" then
-        -- Hemisphere √(1 − t²): spherical cap; zero slope at center (smooth top).
+    end,
+    circle = function(normalized, strength)
         local inner = 1 - normalized * normalized
         if inner <= 0 then return 0 end
-        local w = math.sqrt(inner)
-        return math.min(1, w * strength)
-    elseif falloff_type_name == "gaussian" then
-        -- Quadratic in distance: tighter bell than exponential at same strength.
+        return math.min(1, math.sqrt(inner) * strength)
+    end,
+    gaussian = function(normalized, strength)
         return math.exp(-strength * 4 * normalized * normalized)
-    elseif falloff_type_name == "cosine" then
-        -- Half raised cosine: smooth Hann-like edge, no cusp at brush rim.
+    end,
+    cosine = function(normalized, strength)
         return math.min(1, 0.5 * (1 + math.cos(math.pi * normalized)) * strength)
-    else
-        return math.exp(-strength * 3 * normalized)
+    end,
+}
+
+function M.calculate_falloff(distance, radius, falloff_type_name, strength)
+    if distance > radius then return 0 end
+    local normalized = radius > 1e-12 and (distance / radius) or 0
+    local curve = FALLOFF_CURVES[falloff_type_name]
+    if not curve then
+        error(string.format("Envelope Brush Tool: unknown falloff type %q", tostring(falloff_type_name)))
     end
+    return curve(normalized, strength)
 end
 
 return M

@@ -1,5 +1,9 @@
 local M = {}
 
+local _mod_dir = (((debug.getinfo(1, "S").source or ""):match("^@(.+)$")) or ""):match("^(.*[\\/])") or ""
+local Path = dofile(_mod_dir .. "path.lua")
+local Style = Path.load_from_modules("render/imgui_style.lua")
+
 --- ReaImGui must see ImGui_Begin/End each defer tick when the arrange HUD skips Begin (no lane hover yet).
 --- Invisible host window; size/scroll/falloff/power remain on the lane HUD + wheel + RMB panel.
 function M.pump_imgui_frame(state)
@@ -9,15 +13,13 @@ function M.pump_imgui_frame(state)
     end
 
     local ok = pcall(function()
-        local cond = reaper.ImGui_Cond_Always and reaper.ImGui_Cond_Always() or 0
+        local cond = Style.cond_always()
         reaper.ImGui_SetNextWindowPos(ctx, -10000, -10000, cond)
         reaper.ImGui_SetNextWindowSize(ctx, 10, 10, cond)
 
         local flags = 0
         local function add(f)
-            if f == nil then return end
-            local v = type(f) == "function" and f() or f
-            flags = flags | v
+            flags = flags | Style.flag(f)
         end
         add(reaper.ImGui_WindowFlags_NoTitleBar)
         add(reaper.ImGui_WindowFlags_NoResize)

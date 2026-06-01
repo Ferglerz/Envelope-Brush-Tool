@@ -1,7 +1,9 @@
 local M = {}
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.+[\\/])") or ""
-local Mods = dofile(DIR .. "mods.lua")
+local _mod_dir = (((debug.getinfo(1, "S").source or ""):match("^@(.+)$")) or ""):match("^(.*[\\/])") or ""
+local Path = dofile(_mod_dir .. "path.lua")
+local Util = Path.load_from_modules("util.lua")
+local Mods = Path.load_from_modules("mods.lua")
 
 local function imgui_mouse_wheel_sum(state)
     local w = 0
@@ -157,7 +159,7 @@ function M.apply_envelope_undo_finalize(state, opts)
         end
         local sort_fn = opts and opts.sort_envelope_points_for_autoitem
         if sort_fn then
-            sort_fn(state.target_envelope, state.envelope_autoitem_idx or -1)
+            sort_fn(state.target_envelope, Util.track_autoitem_idx(state))
         end
         reaper.UpdateArrange()
         state.sculpt_sort_pending = false
@@ -274,14 +276,13 @@ function M.handle_wheel_input(state, config, clamp, core)
     local fcfg, scfg, bcfg, wcfg = config.falloff, config.sculpt, config.brush, config.wheel
     if alt then
         M.clear_wheel_momentum(state)
-        local step = fcfg.FALLOFF_STRENGTH_STEP * fine
-        state.falloff_strength = clamp(state.falloff_strength + d * step,
-            fcfg.MIN_FALLOFF_STRENGTH, fcfg.MAX_FALLOFF_STRENGTH)
+        local step = core.falloff_wheel_step(config, fine)
+        state.falloff_strength = core.clamp_falloff_strength(
+            state.falloff_strength + d * step, config)
     elseif wheel_mod_power_cmd_ctrl(arrange_wparam_lo) then
         M.clear_wheel_momentum(state)
-        local step = scfg.SCULPT_POWER_STEP * fine
-        state.sculpt_power = clamp(state.sculpt_power + d * step,
-            scfg.MIN_SCULPT_POWER, scfg.MAX_SCULPT_POWER)
+        local step = core.sculpt_wheel_step(config, fine)
+        state.sculpt_power = core.clamp_sculpt_power(state.sculpt_power + d * step, config)
     else
         local step = math.max(1, math.floor(bcfg.BRUSH_SIZE_STEP * fine + 0.5))
         state.brush_size = clamp(state.brush_size + d_size * step,

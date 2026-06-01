@@ -1,36 +1,13 @@
 local M = {}
 
-local SCRIPT_PATH = debug.getinfo(1, "S").source:match("^@(.+)$") or ""
-local SCRIPT_DIR = SCRIPT_PATH:match("^(.*[\\/])") or ""
-local EnvApi = dofile(SCRIPT_DIR .. "envelope/envelope_api.lua")
-local Mods = dofile(SCRIPT_DIR .. "mods.lua")
-
-local function scaling_mode(envelope)
-    if not envelope then return 0 end
-    return reaper.GetEnvelopeScalingMode(envelope) or 0
-end
-
-local function api_value_to_linear(envelope, value)
-    if type(value) ~= "number" then return value end
-    local mode = scaling_mode(envelope)
-    if mode == 0 then return value end
-    return reaper.ScaleFromEnvelopeMode(mode, value)
-end
-
-local function linear_value_to_api(envelope, value)
-    if type(value) ~= "number" then return value end
-    local mode = scaling_mode(envelope)
-    if mode == 0 then return value end
-    return reaper.ScaleToEnvelopeMode(mode, value)
-end
+local _mod_dir = (((debug.getinfo(1, "S").source or ""):match("^@(.+)$")) or ""):match("^(.*[\\/])") or ""
+local Path = dofile(_mod_dir .. "path.lua")
+local EnvApi = Path.load_from_modules("envelope/envelope_api.lua")
+local ValueScaling = Path.load_from_modules("envelope/value_scaling.lua")
+local Mods = Path.load_from_modules("mods.lua")
 
 local function count_envelope_points(envelope, autoitem_idx)
     return reaper.CountEnvelopePoints(envelope)
-end
-
-function M.count_envelope_points(envelope, autoitem_idx)
-    if not envelope then return 0 end
-    return count_envelope_points(envelope, autoitem_idx or -1)
 end
 
 local function get_envelope_point(envelope, autoitem_idx, i)
@@ -38,28 +15,15 @@ local function get_envelope_point(envelope, autoitem_idx, i)
     if not ok then
         return false, nil, nil, shape, tension, selected
     end
-    return true, t, api_value_to_linear(envelope, v), shape, tension, selected
-end
-
---- Calls fn(i, time, value) for each point on the envelope or automation item.
-function M.for_each_envelope_point(envelope, autoitem_idx, fn)
-    if not envelope or not fn then return end
-    local ai = autoitem_idx ~= nil and autoitem_idx or -1
-    local n = count_envelope_points(envelope, ai)
-    for i = 0, n - 1 do
-        local ok, t, v = get_envelope_point(envelope, ai, i)
-        if ok then
-            fn(i, t, v)
-        end
-    end
+    return true, t, ValueScaling.api_value_to_linear(envelope, v), shape, tension, selected
 end
 
 local function set_envelope_point(envelope, autoitem_idx, i, t, v, shape, tension, sel, no_sort)
-    return reaper.SetEnvelopePoint(envelope, i, t, linear_value_to_api(envelope, v), shape, tension, sel, no_sort)
+    return reaper.SetEnvelopePoint(envelope, i, t, ValueScaling.linear_value_to_api(envelope, v), shape, tension, sel, no_sort)
 end
 
 local function insert_envelope_point(envelope, autoitem_idx, t, v, shape, tension, sel, no_sort)
-    return reaper.InsertEnvelopePoint(envelope, t, linear_value_to_api(envelope, v), shape, tension, sel, no_sort)
+    return reaper.InsertEnvelopePoint(envelope, t, ValueScaling.linear_value_to_api(envelope, v), shape, tension, sel, no_sort)
 end
 
 function M.sort_envelope_points_for_autoitem(envelope, autoitem_idx)
@@ -176,22 +140,6 @@ function M.remove_redundant_envelope_points_by_angle(config, envelope, autoitem_
         reaper.UpdateArrange()
     end
     return total_deleted
-end
-
-function M.min_screen_dist_to_envelope_points(envelope, autoitem_idx, sx, sy, envelope_to_screen, get_distance)
-    local best = math.huge
-    local n = count_envelope_points(envelope, autoitem_idx)
-    for i = 0, n - 1 do
-        local ok, t, v = get_envelope_point(envelope, autoitem_idx, i)
-        if ok then
-            local px, py = envelope_to_screen(t, v, envelope)
-            if px and py then
-                local d = get_distance(sx, sy, px, py)
-                if d < best then best = d end
-            end
-        end
-    end
-    return best
 end
 
 --- Same insert time in one seed pass (quantized grid + rim) → duplicate envelope times → vertical spikes.

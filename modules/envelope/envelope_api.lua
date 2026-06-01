@@ -2,17 +2,9 @@
 
 local M = {}
 
-local function scaling_mode(envelope)
-    if not envelope then return 0 end
-    return reaper.GetEnvelopeScalingMode(envelope) or 0
-end
-
-local function api_value_to_linear(envelope, value)
-    if type(value) ~= "number" then return value end
-    local mode = scaling_mode(envelope)
-    if mode == 0 then return value end
-    return reaper.ScaleFromEnvelopeMode(mode, value)
-end
+local _env_dir = (((debug.getinfo(1, "S").source or ""):match("^@(.+)$")) or ""):match("^(.*[\\/])") or ""
+local Path = dofile(_env_dir .. "../path.lua")
+local ValueScaling = Path.load("value_scaling.lua")
 
 --- ReaScript: Envelope_Evaluate(env, time, samplerate, samplesRequested). (time, 0, 0) is not valid (sr=0).
 function M.envelope_value_at_time(envelope, time_pos)
@@ -26,7 +18,7 @@ function M.envelope_value_at_time(envelope, time_pos)
         end
     end
     local _, val = reaper.Envelope_Evaluate(envelope, time_pos, sr, 1)
-    if val ~= nil then return api_value_to_linear(envelope, val) end
+    if val ~= nil then return ValueScaling.api_value_to_linear(envelope, val) end
     return nil
 end
 
@@ -392,7 +384,6 @@ end
 function M.clear_target_envelope_state_only(state)
     state.target_envelope = nil
     state.envelope_autoitem_idx = -1
-    state.cached_envelope = nil
     state.cached_envelope_properties.envelope = nil
     state.cached_defshape_envelope = nil
     state.envelope_flush_pending = false

@@ -1,10 +1,10 @@
 local M = {}
 
-local SCRIPT_PATH = debug.getinfo(1, "S").source:match("^@(.+)$") or ""
-local SCRIPT_DIR = SCRIPT_PATH:match("^(.*[\\/])") or ""
-local Style = dofile(SCRIPT_DIR .. "imgui_style.lua")
-local Draw = dofile(SCRIPT_DIR .. "draw.lua")
-local C = dofile(SCRIPT_DIR .. "constants.lua")
+local _render_dir = (((debug.getinfo(1, "S").source or ""):match("^@(.+)$")) or ""):match("^(.*[\\/])") or ""
+local Path = dofile(_render_dir .. "../path.lua")
+local Style = Path.load("imgui_style.lua")
+local Draw = Path.load("draw.lua")
+local C = Path.load("constants.lua")
 
 local FALLOFF_PREVIEW_W = 36
 local FALLOFF_PREVIEW_H = 20
@@ -70,7 +70,7 @@ local function falloff_combo(ctx, state, config, deps)
     local combo_flags = 0
     if reaper.ImGui_ComboFlags_HeightLargest then
         local f = reaper.ImGui_ComboFlags_HeightLargest
-        combo_flags = type(f) == "function" and f() or f
+        combo_flags = Style.flag(f)
     end
 
     reaper.ImGui_SetNextItemWidth(ctx, popup_w)
@@ -81,7 +81,7 @@ local function falloff_combo(ctx, state, config, deps)
 
     local spacing_pushed = 0
     local isv = reaper.ImGui_StyleVar_ItemSpacing
-    local isv_id = isv and (type(isv) == "function" and isv() or isv) or nil
+    local isv_id = isv and Style.flag(isv) or nil
     if isv_id then
         reaper.ImGui_PushStyleVar(ctx, isv_id, 0, 0)
         spacing_pushed = 1
@@ -127,18 +127,36 @@ local function falloff_combo(ctx, state, config, deps)
     reaper.ImGui_EndCombo(ctx)
 end
 
-local function axis_lock_chip_row(ctx, Style, chip_h, font_closed, font_open, locked, id_stem, axis_letter, tooltip)
-    local icon_w = 28
-    local font_px = math.max(10, chip_h - 7)
+local function axis_lock_chip_row(ctx, Style, chip_size, font_closed, font_open, locked, id_stem, axis_letter, tooltip)
+    local font_px = C.LOCK_ICON_CHIP_FONT_PX or math.max(10, chip_size - 10)
     local font = locked and font_closed or font_open
+    local letter_gap = 6
+
+    local letter_tw, letter_th = reaper.ImGui_CalcTextSize(ctx, axis_letter)
+    if type(letter_tw) ~= "number" then
+        letter_tw, letter_th = select(1, letter_tw), select(2, letter_tw)
+    end
+    letter_th = letter_th or (reaper.ImGui_GetTextLineHeight and reaper.ImGui_GetTextLineHeight(ctx)) or chip_size
+    local row_h = math.max(chip_size, letter_th)
+    local group_w = chip_size + letter_gap + letter_tw
+
+    if reaper.ImGui_BeginGroup then
+        reaper.ImGui_BeginGroup(ctx)
+    end
+    local base_x, base_y = reaper.ImGui_GetCursorPos(ctx)
+    if type(base_x) ~= "number" or type(base_y) ~= "number" then
+        base_x, base_y = 0, 0
+    end
+
     local fp = reaper.ImGui_StyleVar_FramePadding
-    local fp_id = fp and (type(fp) == "function" and fp() or fp) or nil
+    local fp_id = fp and Style.flag(fp) or nil
     if fp_id then
         reaper.ImGui_PushStyleVar(ctx, fp_id, 0, 0)
     end
 
+    reaper.ImGui_SetCursorPos(ctx, base_x, base_y + (row_h - chip_size) * 0.5)
     reaper.ImGui_PushFont(ctx, font, font_px)
-    local clicked = Style.chip_button(ctx, "##lock" .. id_stem, locked, icon_w, chip_h)
+    local clicked = Style.chip_button(ctx, "##lock" .. id_stem, locked, chip_size, chip_size)
 
     local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
     if draw_list then
@@ -149,8 +167,8 @@ local function axis_lock_chip_row(ctx, Style, chip_h, font_closed, font_open, lo
                 tw, th = select(1, tw), select(2, tw)
             end
             th = th or font_px
-            local tx = rx + (icon_w - tw) * 0.5
-            local ty = ry + (chip_h - th) * 0.5 + (C.LOCK_ICON_CHIP_Y_OFFSET or 0)
+            local tx = rx + (chip_size - tw) * 0.5
+            local ty = ry + (chip_size - th) * 0.5 + (C.LOCK_ICON_CHIP_Y_OFFSET or 0)
             reaper.ImGui_DrawList_AddText(draw_list, tx, ty, 0xEEEEEEFF, C.LOCK_GLYPH)
         end
     end
@@ -162,11 +180,14 @@ local function axis_lock_chip_row(ctx, Style, chip_h, font_closed, font_open, lo
     if tooltip and reaper.ImGui_IsItemHovered and reaper.ImGui_IsItemHovered(ctx) and reaper.ImGui_SetTooltip then
         reaper.ImGui_SetTooltip(ctx, tooltip)
     end
-    reaper.ImGui_SameLine(ctx, 0, 6)
-    if reaper.ImGui_AlignTextToFramePadding then
-        reaper.ImGui_AlignTextToFramePadding(ctx)
-    end
+
+    reaper.ImGui_SetCursorPos(ctx, base_x + chip_size + letter_gap, base_y + (row_h - letter_th) * 0.5)
     reaper.ImGui_Text(ctx, axis_letter)
+    reaper.ImGui_Dummy(ctx, group_w, row_h)
+
+    if reaper.ImGui_EndGroup then
+        reaper.ImGui_EndGroup(ctx)
+    end
     return clicked
 end
 
@@ -192,7 +213,7 @@ function M.render_brush_hud_panel(state, config, deps, hud)
     end
 
     local radius = state.brush_size or 40
-    local cond = reaper.ImGui_Cond_Always and reaper.ImGui_Cond_Always() or 0
+    local cond = Style.cond_always()
     local text_x = cx + radius + 10
     reaper.ImGui_SetNextWindowPos(ctx, text_x, cy - radius, cond)
 
@@ -200,16 +221,20 @@ function M.render_brush_hud_panel(state, config, deps, hud)
         reaper.ImGui_SetNextWindowBgAlpha(ctx, 0)
     end
 
-    local flags = (reaper.ImGui_WindowFlags_NoTitleBar and reaper.ImGui_WindowFlags_NoTitleBar() or 0)
-        | (reaper.ImGui_WindowFlags_NoResize and reaper.ImGui_WindowFlags_NoResize() or 0)
-        | (reaper.ImGui_WindowFlags_AlwaysAutoResize and reaper.ImGui_WindowFlags_AlwaysAutoResize() or 0)
-        | (reaper.ImGui_WindowFlags_NoDocking and reaper.ImGui_WindowFlags_NoDocking() or 0)
-        | (reaper.ImGui_WindowFlags_NoSavedSettings and reaper.ImGui_WindowFlags_NoSavedSettings() or 0)
-        | (reaper.ImGui_WindowFlags_NoBackground and reaper.ImGui_WindowFlags_NoBackground() or 0)
+    local flags = Style.flags_or(
+        reaper.ImGui_WindowFlags_NoTitleBar,
+        reaper.ImGui_WindowFlags_NoResize,
+        reaper.ImGui_WindowFlags_AlwaysAutoResize,
+        reaper.ImGui_WindowFlags_NoDocking,
+        reaper.ImGui_WindowFlags_NoSavedSettings,
+        reaper.ImGui_WindowFlags_NoBackground
+    )
     if not state.brush_settings_mode then
-        flags = flags | (reaper.ImGui_WindowFlags_NoNav and reaper.ImGui_WindowFlags_NoNav() or 0)
-            | (reaper.ImGui_WindowFlags_NoInputs and reaper.ImGui_WindowFlags_NoInputs() or 0)
-            | (reaper.ImGui_WindowFlags_NoMouseInputs and reaper.ImGui_WindowFlags_NoMouseInputs() or 0)
+        flags = flags | Style.flags_or(
+            reaper.ImGui_WindowFlags_NoNav,
+            reaper.ImGui_WindowFlags_NoInputs,
+            reaper.ImGui_WindowFlags_NoMouseInputs
+        )
     end
 
     local col_w = 136
@@ -245,8 +270,10 @@ function M.render_brush_hud_panel(state, config, deps, hud)
     end
 
     local size_txt = string.format("Size: %d", state.brush_size)
-    local fall_txt = string.format("Falloff strength: %.1f", state.falloff_strength)
-    local pow_txt = string.format("Power: %.2f", state.sculpt_power or 1)
+    local fall_pct = deps.falloff_strength_percent(state.falloff_strength)
+    local fall_txt = string.format("Falloff: %.1f%%", fall_pct)
+    local pow_pct = deps.sculpt_power_percent(state.sculpt_power)
+    local pow_txt = string.format("Power: %.1f%%", pow_pct)
     local gap = "   "
     reaper.ImGui_Text(ctx, size_txt .. gap .. fall_txt .. gap .. pow_txt)
 
@@ -272,16 +299,16 @@ function M.render_brush_hud_panel(state, config, deps, hud)
     if state.brush_settings_mode then
         reaper.ImGui_Dummy(ctx, 0, 3)
 
-        local chip_h = 26
+        local chip_size = 28
         local fc, fo = state.font_lock_closed, state.font_lock_open
-        if axis_lock_chip_row(ctx, Style, chip_h, fc, fo, state.lock_time_axis, "lx", "X", "Lock time (horizontal). X key toggles.") then
+        if axis_lock_chip_row(ctx, Style, chip_size, fc, fo, state.lock_time_axis, "lx", "X", "Lock time (horizontal). X key toggles.") then
             state.lock_time_axis = not state.lock_time_axis
             if state.lock_time_axis then
                 state.lock_value_axis = false
             end
         end
         reaper.ImGui_SameLine(ctx, 0, 10)
-        if axis_lock_chip_row(ctx, Style, chip_h, fc, fo, state.lock_value_axis, "ly", "Y", "Lock value (vertical). Y key toggles.") then
+        if axis_lock_chip_row(ctx, Style, chip_size, fc, fo, state.lock_value_axis, "ly", "Y", "Lock value (vertical). Y key toggles.") then
             state.lock_value_axis = not state.lock_value_axis
             if state.lock_value_axis then
                 state.lock_time_axis = false

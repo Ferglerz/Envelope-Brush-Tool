@@ -45,6 +45,7 @@ local D = Deps.new(State, CONFIG, {
 
 --- Must be declared before init(): init assigns deps used by apply_envelope_drag_tick (same local, not global).
 local DRAG_INPUT_DEPS
+local RENDER_DEPS
 
 local function init()
     if not reaper.ImGui_CreateContext then
@@ -115,6 +116,20 @@ local function init()
         refresh_captured_from_envelope = D.refresh_captured_from_envelope,
         sync_brush_point_selection = D.sync_brush_point_selection,
         get_distance = Core.get_distance,
+    }
+
+    RENDER_DEPS = {
+        calc_inner_brush_radius = D.calc_inner_brush_radius,
+        get_arrange_imgui_overlay_geometry = D.get_arrange_imgui_overlay_geometry,
+        brush_center_client_xy = D.brush_center_client_xy,
+        get_mouse_client_xy = D.get_mouse_client_xy,
+        arrange_client_to_imgui = D.arrange_client_to_imgui,
+        brush_drag_kind_display = D.brush_drag_kind_display,
+        primary_modifier_short_name = D.primary_modifier_short_name,
+        falloff_strength_percent = D.falloff_strength_percent,
+        sculpt_power_percent = D.sculpt_power_percent,
+        calculate_falloff = Core.calculate_falloff,
+        clear_wheel_momentum = Input.clear_wheel_momentum,
     }
 
     ProjExt.load_into_state(State, CONFIG)
@@ -206,7 +221,6 @@ local function main_loop()
 
     if ProjExt.tick_project_switch(State, CONFIG) then
         Input.clear_wheel_momentum(State)
-        State.prepared_insert_envelope = nil
         State.seed_hover_cache = nil
         State.seed_hover_last_client = nil
     end
@@ -261,19 +275,6 @@ local function main_loop()
 
     Render.update_brush_hud_text_fade(State, CONFIG, lmb_down, Render.brush_hud_visible(State))
 
-    local render_deps = {
-        calc_inner_brush_radius = D.calc_inner_brush_radius,
-        get_arrange_imgui_overlay_geometry = D.get_arrange_imgui_overlay_geometry,
-        brush_center_client_xy = D.brush_center_client_xy,
-        get_mouse_client_xy = D.get_mouse_client_xy,
-        get_mouse_imgui_xy = D.get_mouse_imgui_xy,
-        envelope_to_screen = D.envelope_to_screen,
-        arrange_client_to_imgui = D.arrange_client_to_imgui,
-        brush_drag_kind_display = D.brush_drag_kind_display,
-        primary_modifier_short_name = D.primary_modifier_short_name,
-        calculate_falloff = Core.calculate_falloff,
-        clear_wheel_momentum = Input.clear_wheel_momentum,
-    }
     Input.tick_brush_settings_lmb_dismiss(State, {
         get_mouse_imgui_xy = D.get_mouse_imgui_xy,
         is_lmb_down_js = Core.is_lmb_down_js,
@@ -292,8 +293,8 @@ local function main_loop()
     end
 
     if Core.is_reaper_foreground() and not State._shutdown_complete then
-        Render.render_brush_hud(State, CONFIG, render_deps)
-        Render.render_brush_hud_panel(State, CONFIG, render_deps)
+        Render.render_brush_hud(State, CONFIG, RENDER_DEPS)
+        Render.render_brush_hud_panel(State, CONFIG, RENDER_DEPS)
     end
 
     if State.script_close_requested then
