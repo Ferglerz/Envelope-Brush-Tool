@@ -6,6 +6,23 @@ function M.clamp(x, lo, hi)
     return x
 end
 
+function M.stroke_time_key(t)
+    return math.floor(t * 1e9 + 0.5)
+end
+
+--- SWS cursor timeline position (one BR_GetMouseCursorContext per call).
+function M.mouse_cursor_time()
+    if not reaper.BR_GetMouseCursorContext_Position or not reaper.BR_GetMouseCursorContext then
+        return nil
+    end
+    reaper.BR_GetMouseCursorContext()
+    local t = reaper.BR_GetMouseCursorContext_Position()
+    if type(t) ~= "number" or t ~= t then
+        return nil
+    end
+    return t
+end
+
 --- Returns current target autoitem_idx (-1 for parent/track envelope lane, >=0 for automation item on that envelope).
 function M.track_autoitem_idx(state)
     return state.envelope_autoitem_idx or -1

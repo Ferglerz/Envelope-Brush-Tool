@@ -2,9 +2,22 @@
 
 local M = {}
 
+local _mode_cache = {}
+
+function M.invalidate(envelope)
+    if envelope then
+        _mode_cache[envelope] = nil
+    end
+end
+
 function M.scaling_mode(envelope)
     if not envelope then return 0 end
-    return reaper.GetEnvelopeScalingMode(envelope) or 0
+    local mode = _mode_cache[envelope]
+    if mode == nil then
+        mode = reaper.GetEnvelopeScalingMode(envelope) or 0
+        _mode_cache[envelope] = mode
+    end
+    return mode
 end
 
 function M.api_value_to_linear(envelope, value)

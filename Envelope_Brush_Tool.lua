@@ -34,21 +34,15 @@ local Ops = dofile(SCRIPT_DIR .. "modules/ops.lua")
 local Render = dofile(SCRIPT_DIR .. "modules/render/render.lua")
 local Input = dofile(SCRIPT_DIR .. "modules/input.lua")
 local UI = dofile(SCRIPT_DIR .. "modules/ui.lua")
-local Deps = dofile(SCRIPT_DIR .. "modules/deps.lua")
+local Brush = dofile(SCRIPT_DIR .. "modules/brush_session.lua")
 local ProjExt = dofile(SCRIPT_DIR .. "modules/project_ext.lua")
 local ActionShortcuts = dofile(SCRIPT_DIR .. "modules/action_shortcuts.lua")
+local Util = dofile(SCRIPT_DIR .. "modules/util.lua")
 
 local CONFIG = Core.CONFIG
 local State = Core.new_state(CONFIG)
-local D = Deps.new(State, CONFIG, {
-    core = Core,
-    envelope = Envelope,
-    ops = Ops,
-    input = Input,
-})
 
---- Must be declared before init(): init assigns deps used by apply_envelope_drag_tick (same local, not global).
-local DRAG_INPUT_DEPS
+local DRAG_DEPS
 local RENDER_DEPS
 
 local function init()
@@ -68,7 +62,6 @@ local function init()
         reaper.ShowMessageBox("This script requires REAPER Undo_OnStateChangeEx2 for named brush undo points.", "Old REAPER", 0)
         return false
     end
-    -- BR_GetMouseCursorContext_EnvelopeEx (SWS ~2.12+ / 2025 builds) enables auto-item index detection; without it, only parent lane (ai=-1) works.
     if not reaper.JS_Window_FindChildByID or not reaper.JS_Window_GetClientRect or not reaper.JS_Window_ScreenToClient
         or not reaper.JS_Window_ClientToScreen or not reaper.JS_Window_GetRect or not reaper.ImGui_PointConvertNative
         or not reaper.JS_Window_GetForeground or not reaper.JS_Window_GetParent
@@ -101,7 +94,6 @@ local function init()
         return false
     end
 
-    --- Fonts are Resource objects; without Attach they expire after a few idle timer ticks (before first HUD use).
     if reaper.ImGui_Attach then
         reaper.ImGui_Attach(State.ctx, State.font_lock_closed)
         reaper.ImGui_Attach(State.ctx, State.font_lock_open)
@@ -112,7 +104,7 @@ local function init()
         return false
     end
     Core.refresh_frame_arrange(State)
-    if not D.setup_envelope_bounds() then
+    if not Envelope.setup_envelope_bounds(State, CONFIG, Core.get_arrange_hwnd) then
         reaper.ShowMessageBox("Could not read arrange view client bounds.", "Arrange Bounds Unavailable", 0)
         return false
     end
@@ -122,30 +114,8 @@ local function init()
         return false
     end
 
-    DRAG_INPUT_DEPS = {
-        seed_brush_width_at_client = D.seed_brush_width_at_client,
-        capture_points_in_radius = D.capture_points_in_radius,
-        sculpt_captured_points = D.sculpt_captured_points,
-        refresh_captured_from_envelope = D.refresh_captured_from_envelope,
-        sync_brush_point_selection = D.sync_brush_point_selection,
-        get_distance = Core.get_distance,
-    }
-
-    RENDER_DEPS = {
-        calc_inner_brush_radius = D.calc_inner_brush_radius,
-        get_arrange_imgui_overlay_geometry = D.get_arrange_imgui_overlay_geometry,
-        brush_center_client_xy = D.brush_center_client_xy,
-        get_mouse_client_xy = D.get_mouse_client_xy,
-        arrange_client_to_imgui = D.arrange_client_to_imgui,
-        brush_drag_kind_key = D.brush_drag_kind_key,
-        brush_drag_kind_display = D.brush_drag_kind_display,
-        brush_mode_falloff_header = D.brush_mode_falloff_header,
-        primary_modifier_short_name = D.primary_modifier_short_name,
-        falloff_strength_percent = D.falloff_strength_percent,
-        sculpt_power_percent = D.sculpt_power_percent,
-        calculate_falloff = Core.calculate_falloff,
-        clear_wheel_momentum = Input.clear_wheel_momentum,
-    }
+    DRAG_DEPS = Brush.drag_deps(State, CONFIG, Core, Envelope, Ops)
+    RENDER_DEPS = Brush.render_deps(State, CONFIG, Core, Input)
 
     ProjExt.load_into_state(State, CONFIG)
     ProjExt.after_load_init(State)
@@ -155,22 +125,19 @@ local function init()
     return true
 end
 
---- LMB-down envelope work for one sampled client position.
 local function apply_envelope_drag_tick(mx, my)
     if State.brush_settings_mode or not Core.brush_lmb_may_start_stroke(State) or mx == nil or my == nil then
         return
     end
-    local deps_drag = DRAG_INPUT_DEPS
     if not State.is_dragging then
-        Input.on_lmb_pressed(State, CONFIG, mx, my, deps_drag)
+        Input.on_lmb_pressed(State, CONFIG, mx, my, DRAG_DEPS)
     elseif State.drag_mode == "sculpt" then
-        Input.try_apply_sculpt_drag(State, CONFIG, mx, my, deps_drag)
+        Input.try_apply_sculpt_drag(State, CONFIG, mx, my, DRAG_DEPS)
     elseif State.drag_mode == "combined" then
-        Input.try_combined_drag(State, CONFIG, mx, my, deps_drag)
+        Input.try_combined_drag(State, CONFIG, mx, my, DRAG_DEPS)
     end
 end
 
---- Runs at the start of a defer tick (after REAPER/ImGui yielded). Mouse is sampled again here.
 local function run_pending_envelope_flush()
     if not State.envelope_flush_pending then
         return
@@ -185,7 +152,7 @@ local function run_pending_envelope_flush()
         reaper.PreventUIRefresh(1)
     end
 
-    local mx, my = D.get_mouse_client_xy()
+    local mx, my = Brush.get_mouse_client_xy(State, Core)
     if mx and my then
         if CONFIG.arrange.DEFER_ENVELOPE_SUPPRESS_CONTROL_IMGUI then
             State.suppress_imgui_control_this_frame = true
@@ -216,7 +183,9 @@ local function on_script_close()
     pcall(Input.end_session_from_script_close, State, {
         config = CONFIG,
         sort_envelope_points_for_autoitem = Ops.sort_envelope_points_for_autoitem,
-        cleanup_redundant_points_after_drag = D.run_smooth_angle_cleanup_on_lmb_up,
+        cleanup_redundant_points_after_drag = function()
+            Brush.run_smooth_angle_cleanup_on_lmb_up(State, CONFIG, Core, Envelope, Ops, Input)
+        end,
     })
     if State.ctx and reaper.ImGui_DestroyContext then
         pcall(reaper.ImGui_DestroyContext, State.ctx)
@@ -227,13 +196,12 @@ local function on_script_close()
 end
 
 local function main_loop()
-    --- After synchronous `close()` from a newer run, defer may still fire once; do not reschedule.
     if not State.ctx then
         return
     end
 
     Core.refresh_frame_arrange(State)
-    if not D.setup_envelope_bounds() then
+    if not Envelope.setup_envelope_bounds(State, CONFIG, Core.get_arrange_hwnd) then
         reaper.defer(main_loop)
         return
     end
@@ -245,7 +213,9 @@ local function main_loop()
         State.envelope_ai_lane_cache = nil
     end
 
-    local mouse_x, mouse_y = D.get_mouse_client_xy()
+    State._brush_center_time = Util.mouse_cursor_time()
+
+    local mouse_x, mouse_y = Brush.get_mouse_client_xy(State, Core)
     if mouse_x == nil or mouse_y == nil then
         reaper.defer(main_loop)
         return
@@ -256,19 +226,12 @@ local function main_loop()
     local lmb_edge_down = lmb_down and not State._lmb_was_down_prev
     State._lmb_was_down_prev = lmb_down
 
-    Envelope.detect_envelope(State, {
-        is_envelope_lane_visible = Core.is_envelope_lane_visible,
-        clear_target_envelope_state_only = D.clear_target_envelope_state_only,
-        setup_envelope_bounds = D.setup_envelope_bounds,
-        get_mouse_client_xy = D.get_mouse_client_xy,
-        point_hits_envelope_curve = D.point_hits_envelope_curve,
-    })
+    Envelope.detect_envelope(State, Core, CONFIG)
 
     if not lmb_down and not State.is_dragging and not State.brush_settings_mode and State.envelope_lane_hover then
-        D.warm_seed_cache_for_hover(mouse_x, mouse_y)
+        Brush.warm_seed_cache_for_hover(State, CONFIG, Core, Envelope, Ops, mouse_x, mouse_y)
     end
 
-    -- After SWS/bounds update: flush uses a stable target_envelope for the whole LMB-down stroke.
     run_pending_envelope_flush()
 
     if lmb_edge_down and State.envelope_lane_hover and State.target_envelope and not State.brush_settings_mode then
@@ -282,12 +245,11 @@ local function main_loop()
     local eat_rmb = State.target_envelope and (brush_active or State.brush_settings_mode)
     Core.process_arrange_lmb_or_forward(State, stroke_lmb, eat_rmb)
 
-    -- Schedule envelope work for the *next* defer tick (see run_pending_envelope_flush): same-tick-as-ImGui was unreliable.
     Core.sync_arrange_mouse_eat_with_os(State, lmb_down, Core.is_rmb_down_js())
     if lmb_down and stroke_lmb and not State.brush_settings_mode then
         State.envelope_flush_pending = true
     elseif not lmb_down and State.is_dragging then
-        D.end_drag_operation()
+        Brush.end_drag_operation(State, CONFIG, Core, Envelope, Ops, Input)
     elseif not lmb_down and (State.envelope_stroke_dirty or State.pending_undo_label) then
         Input.apply_envelope_undo_finalize(State, {
             config = CONFIG,
@@ -297,21 +259,25 @@ local function main_loop()
 
     Input.tick_rmb_brush_settings(State, Render.brush_hud_interactive(State), mouse_x, mouse_y)
     if State.brush_settings_mode and State.is_dragging then
-        D.end_drag_operation()
+        Brush.end_drag_operation(State, CONFIG, Core, Envelope, Ops, Input)
     end
 
     if State.suppress_imgui_control_this_frame then
         State.suppress_imgui_control_this_frame = false
     end
-    UI.pump_imgui_frame(State)
+
+    local hud_rings = Render.brush_hud_visible(State)
+    if not hud_rings then
+        UI.pump_imgui_frame(State)
+    end
 
     local open = true
 
     local hud_show = Render.brush_hud_visible(State)
-    Render.update_brush_hud_text_fade(State, CONFIG, lmb_down, hud_show or Core.brush_tool_active(State))
+    Render.update_brush_hud_text_fade(State, CONFIG, lmb_down, hud_show or brush_active)
 
     Input.tick_brush_settings_lmb_dismiss(State, {
-        get_mouse_imgui_xy = D.get_mouse_imgui_xy,
+        get_mouse_imgui_xy = function() return Core.get_mouse_imgui_xy(State.ctx) end,
         is_lmb_down_js = Core.is_lmb_down_js,
     })
 

@@ -93,7 +93,6 @@ return {
 
     --- LMB drag mode labels (nudge / sculpt / smooth)
     drag = {
-        BRUSH_DRAG_KINDS = { "nudge", "sculpt", "smooth" },
         BRUSH_DRAG_KIND_LABELS = { nudge = "Nudge", sculpt = "Sculpt", smooth = "Smooth" },
     },
 
@@ -144,7 +143,7 @@ return {
         HOVER_WARM_ENABLED = true,
         HOVER_WARM_INTERVAL_SEC = 0.05,
         HOVER_WARM_MIN_MOUSE_MOVE_PX = 2,
-        HOVER_WARM_PRECOMPUTE_INSERT_CANDIDATES = true,
+        HOVER_WARM_PRECOMPUTE_INSERT_CANDIDATES = false,
         SEED_CACHE_REUSE_CENTER_TOLERANCE_PX = 3,
         SEED_CACHE_MAX_AGE_SEC = 0.25,
     },

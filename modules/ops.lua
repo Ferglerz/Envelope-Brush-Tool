@@ -3,33 +3,19 @@ local M = {}
 local _mod_dir = (((debug.getinfo(1, "S").source or ""):match("^@(.+)$")) or ""):match("^(.*[\\/])") or ""
 local Path = dofile(_mod_dir .. "path.lua")
 local EnvApi = Path.load_from_modules("envelope/envelope_api.lua")
-local ValueScaling = Path.load_from_modules("envelope/value_scaling.lua")
-local Mods = Path.load_from_modules("mods.lua")
+local Util = Path.load_from_modules("util.lua")
 local BezierFit = Path.load_from_modules("bezier_fit.lua")
 
-local function count_envelope_points(envelope, autoitem_idx)
-    return reaper.CountEnvelopePointsEx(envelope, autoitem_idx or -1)
-end
+local JS_SHIFT = 8
 
-local function get_envelope_point(envelope, autoitem_idx, i)
-    local ok, t, v, shape, tension, selected = reaper.GetEnvelopePointEx(envelope, autoitem_idx or -1, i)
-    if not ok then
-        return false, nil, nil, shape, tension, selected
-    end
-    return true, t, ValueScaling.api_value_to_linear(envelope, v), shape, tension, selected
-end
-
-local function set_envelope_point(envelope, autoitem_idx, i, t, v, shape, tension, sel, no_sort)
-    return reaper.SetEnvelopePointEx(envelope, autoitem_idx or -1, i, t, ValueScaling.linear_value_to_api(envelope, v), shape, tension, sel, no_sort)
-end
-
-local function insert_envelope_point(envelope, autoitem_idx, t, v, shape, tension, sel, no_sort)
-    return reaper.InsertEnvelopePointEx(envelope, autoitem_idx or -1, t, ValueScaling.linear_value_to_api(envelope, v), shape, tension, sel, no_sort)
-end
+local count_envelope_points = EnvApi.count_envelope_points
+local get_envelope_point = EnvApi.get_envelope_point
+local set_envelope_point = EnvApi.set_envelope_point
+local insert_envelope_point = EnvApi.insert_envelope_point
 
 function M.sort_envelope_points_for_autoitem(envelope, autoitem_idx)
     if not envelope then return end
-    reaper.Envelope_SortPointsEx(envelope, autoitem_idx or -1)
+    EnvApi.sort_envelope_points(envelope, autoitem_idx)
 end
 
 local function sort_envelope_points(envelope, autoitem_idx)
@@ -395,10 +381,6 @@ local function interior_chord_deviation_val(rows, left_i, right_i)
     return sum / n
 end
 
-local function stroke_time_key(t)
-    return math.floor(t * 1e9 + 0.5)
-end
-
 local function freeze_stroke_point_times(stroke_point_times)
     if not stroke_point_times or next(stroke_point_times) == nil then
         return nil, nil
@@ -407,7 +389,7 @@ local function freeze_stroke_point_times(stroke_point_times)
     local t_lo, t_hi = math.huge, -math.huge
     for _, t in pairs(stroke_point_times) do
         if type(t) == "number" and t == t then
-            frozen[stroke_time_key(t)] = t
+            frozen[Util.stroke_time_key(t)] = t
             if t < t_lo then t_lo = t end
             if t > t_hi then t_hi = t end
         end
@@ -772,7 +754,7 @@ function M.remove_redundant_envelope_points_by_angle(
     local ccfg = config.cleanup or {}
     local min_angle = ccfg.REDUNDANT_POINT_MIN_ANGLE_DEG or 175
     if min_angle < 0 then min_angle = 0 elseif min_angle > 180 then min_angle = 180 end
-    local max_passes = ccfg.ANGLE_CLEANUP_MAX_PASSES or 64
+    local max_passes = ccfg.ANGLE_CLEANUP_MAX_PASSES or 16
     if max_passes < 1 then max_passes = 1 end
 
     local total_deleted = 0
@@ -839,23 +821,65 @@ local function insert_t_already_placed(list, insert_t, eps_t)
     return false
 end
 
-local function mouse_cursor_time()
-    if not reaper.BR_GetMouseCursorContext_Position or not reaper.BR_GetMouseCursorContext then
-        return nil
+local function brush_center_time(state)
+    if state._brush_center_time ~= nil then
+        return state._brush_center_time
     end
-    -- SWS updates cursor-position context on BR_GetMouseCursorContext(); without this,
-    -- BR_GetMouseCursorContext_Position can return stale values intermittently.
-    reaper.BR_GetMouseCursorContext()
-    local t = reaper.BR_GetMouseCursorContext_Position()
-    if type(t) ~= "number" or t ~= t then
-        return nil
-    end
-    return t
+    return Util.mouse_cursor_time()
 end
 
-local function build_seed_screen_point_cache(state, config, mouse_x, mouse_y, radius, envelope, autoitem_idx, screen_to_envelope, envelope_to_screen, _get_envelope_properties, value_for_insert)
-    if not envelope or not screen_to_envelope or not envelope_to_screen then return nil end
-    local center_time = mouse_cursor_time()
+local function collect_seed_insert_candidates(center_time, radius_time, abs_tr, pixel_width, min_space, envelope, autoitem_idx, envelope_to_screen, value_for_insert, precompute)
+    if not value_for_insert or precompute == false then
+        return nil
+    end
+    local span_t = 2 * math.abs(radius_time)
+    if span_t < 1e-18 then
+        return nil
+    end
+    local step_target = abs_tr > 1e-18 and (min_space * 0.45 / pixel_width) * abs_tr or span_t
+    if step_target < 1e-24 or step_target ~= step_target then
+        step_target = span_t
+    end
+    if step_target > span_t then
+        step_target = span_t
+    end
+    local n = math.max(1, math.ceil(span_t / step_target))
+    if n > 256 then
+        n = 256
+    end
+    local actual_step = span_t / n
+    local t0 = center_time - math.abs(radius_time)
+    local eps_ins = math.max(1e-12, math.abs(abs_tr) * 1e-14)
+    local placed_insert_t = {}
+    local seed_candidates = {}
+    for k = 0, n do
+        local point_time = t0 + k * actual_step
+        local time_distance = math.abs(point_time - center_time)
+        local normalized_distance = math.abs(radius_time) > 1e-12 and (time_distance / math.abs(radius_time)) or 0
+        if normalized_distance <= 1.0 + 1e-9 then
+            local base_value, insert_t = value_for_insert(envelope, point_time, autoitem_idx)
+            if base_value ~= nil and insert_t ~= nil and not insert_t_already_placed(placed_insert_t, insert_t, eps_ins) then
+                local sx, sy = envelope_to_screen(insert_t, base_value, envelope)
+                if sx and sy then
+                    seed_candidates[#seed_candidates + 1] = {
+                        insert_t = insert_t,
+                        value = base_value,
+                        sx = sx,
+                        sy = sy,
+                    }
+                    placed_insert_t[#placed_insert_t + 1] = insert_t
+                end
+            end
+        end
+    end
+    return seed_candidates
+end
+
+local function build_seed_screen_point_cache(state, config, center_time, radius, envelope, autoitem_idx, envelope_to_screen, value_for_insert)
+    if not envelope or not envelope_to_screen then return nil end
+    if center_time == nil then
+        center_time = brush_center_time(state)
+    end
     if not center_time then return nil end
 
     local arrange_start = state.frame_arrange_start
@@ -892,50 +916,11 @@ local function build_seed_screen_point_cache(state, config, mouse_x, mouse_y, ra
     local px_tol = scfg.SEED_CACHE_REUSE_CENTER_TOLERANCE_PX or 3
     local tol_t = (abs_tr > 1e-18 and pixel_width > 0) and ((px_tol / pixel_width) * abs_tr) or 0
 
-    local seed_candidates = nil
-    if value_for_insert and (scfg.HOVER_WARM_PRECOMPUTE_INSERT_CANDIDATES ~= false) then
-        local span_t = 2 * math.abs(radius_time)
-        if span_t >= 1e-18 then
-            local step_target = abs_tr > 1e-18 and (min_space * 0.45 / pixel_width) * abs_tr or span_t
-            if step_target < 1e-24 or step_target ~= step_target then
-                step_target = span_t
-            end
-            if step_target > span_t then
-                step_target = span_t
-            end
-            local n = math.max(1, math.ceil(span_t / step_target))
-            if n > 256 then
-                n = 256
-            end
-            local actual_step = span_t / n
-            local t0 = center_time - math.abs(radius_time)
-            local eps_ins = math.max(1e-12, math.abs(time_range) * 1e-14)
-            local placed_insert_t = {}
-            seed_candidates = {}
-            for k = 0, n do
-                local point_time = t0 + k * actual_step
-                local time_distance = math.abs(point_time - center_time)
-                local normalized_distance = math.abs(radius_time) > 1e-12 and (time_distance / math.abs(radius_time)) or 0
-                if normalized_distance <= 1.0 + 1e-9 then
-                    local base_value, insert_t, eval_t = value_for_insert(envelope, point_time, autoitem_idx)
-                    if base_value ~= nil and insert_t ~= nil and not insert_t_already_placed(placed_insert_t, insert_t, eps_ins) then
-                        local t_vis = eval_t or point_time
-                        local new_value = base_value
-                        local sx, sy = envelope_to_screen(t_vis, new_value, envelope)
-                        if sx and sy then
-                            seed_candidates[#seed_candidates + 1] = {
-                                insert_t = insert_t,
-                                value = new_value,
-                                sx = sx,
-                                sy = sy,
-                            }
-                            placed_insert_t[#placed_insert_t + 1] = insert_t
-                        end
-                    end
-                end
-            end
-        end
-    end
+    local seed_candidates = collect_seed_insert_candidates(
+        center_time, radius_time, abs_tr, pixel_width, min_space,
+        envelope, autoitem_idx, envelope_to_screen, value_for_insert,
+        scfg.HOVER_WARM_PRECOMPUTE_INSERT_CANDIDATES ~= false
+    )
 
     return {
         envelope = envelope,
@@ -972,15 +957,15 @@ local function can_reuse_seed_screen_point_cache(cache, envelope, autoitem_idx, 
     return true
 end
 
-function M.build_seed_screen_point_cache(state, config, mouse_x, mouse_y, radius, envelope, autoitem_idx, screen_to_envelope, envelope_to_screen, get_envelope_properties, value_for_insert)
-    return build_seed_screen_point_cache(state, config, mouse_x, mouse_y, radius, envelope, autoitem_idx, screen_to_envelope, envelope_to_screen, get_envelope_properties, value_for_insert)
+function M.build_seed_screen_point_cache(state, config, center_time, radius, envelope, autoitem_idx, envelope_to_screen, value_for_insert)
+    return build_seed_screen_point_cache(state, config, center_time, radius, envelope, autoitem_idx, envelope_to_screen, value_for_insert)
 end
 
 function M.capture_points_in_radius(state, config, mouse_x, mouse_y, radius, envelope, autoitem_idx, envelope_to_screen, get_distance, calculate_falloff)
     if not envelope then return {} end
 
     local _brush_cx, brush_cy = EnvApi.brush_center_client_xy(state, envelope, mouse_x, mouse_y)
-    local center_time = mouse_cursor_time()
+    local center_time = brush_center_time(state)
     local time_range = state.frame_arrange_end - state.frame_arrange_start
     local bounds = state.envelope_bounds
     local pixel_width = bounds.right - bounds.left
@@ -1069,7 +1054,7 @@ local function clamp_captured_times_to_neighbors(tent_t, captured_points, initia
     end
 end
 
-function M.sculpt_captured_points(state, config, captured_points, delta_x, delta_y, envelope, autoitem_idx, _get_envelope_properties, clamp, value_at_time, envelope_to_screen, screen_to_envelope, get_distance)
+function M.sculpt_captured_points(state, config, captured_points, delta_x, delta_y, envelope, autoitem_idx, clamp, envelope_to_screen, screen_to_envelope, get_distance)
     if not envelope or #captured_points == 0 or not envelope_to_screen or not screen_to_envelope or not get_distance then return 0 end
 
     local time_range = state.frame_arrange_end - state.frame_arrange_start
@@ -1083,7 +1068,7 @@ function M.sculpt_captured_points(state, config, captured_points, delta_x, delta
     -- Smooth uses Shift as mode key (no Fine scaling here). Sculpt + Shift: Fine (25% strength).
     local strength_scale = 1.0
     if kind ~= "smooth" and reaper.JS_Mouse_GetState then
-        if (reaper.JS_Mouse_GetState(Mods.JS_SHIFT) or 0) > 0 then
+        if (reaper.JS_Mouse_GetState(JS_SHIFT) or 0) > 0 then
             strength_scale = 0.25
         end
     end
@@ -1136,7 +1121,7 @@ function M.sculpt_captured_points(state, config, captured_points, delta_x, delta
 
         smooth_t_target_by_index = {}
         if not state.lock_time_axis then
-            local center_time = mouse_cursor_time()
+            local center_time = brush_center_time(state)
             local radius_time = (center_time ~= nil) and ((state.brush_size / pixel_width) * math.abs(time_range)) or nil
             local t_lo = (center_time ~= nil and radius_time ~= nil) and (center_time - radius_time) or nil
             local t_hi = (center_time ~= nil and radius_time ~= nil) and (center_time + radius_time) or nil
@@ -1273,10 +1258,10 @@ function M.sculpt_captured_points(state, config, captured_points, delta_x, delta
     return points_moved
 end
 
-function M.create_points_in_brush_area(state, config, mouse_x, mouse_y, radius, envelope, autoitem_idx, screen_to_envelope, envelope_to_screen, get_distance, _get_envelope_properties, value_for_insert, default_point_shape, seed_screen_point_cache)
+function M.create_points_in_brush_area(state, config, _mouse_x, _mouse_y, radius, envelope, autoitem_idx, envelope_to_screen, get_distance, value_for_insert, default_point_shape, seed_screen_point_cache)
     if not envelope or not value_for_insert then return 0 end
 
-    local center_time = mouse_cursor_time()
+    local center_time = brush_center_time(state)
     if not center_time then return 0 end
 
     local arrange_start = state.frame_arrange_start
@@ -1308,17 +1293,8 @@ function M.create_points_in_brush_area(state, config, mouse_x, mouse_y, radius, 
     local active_seed_cache = seed_screen_point_cache
     if not cache_ok then
         active_seed_cache = build_seed_screen_point_cache(
-            state,
-            config,
-            mouse_x,
-            mouse_y,
-            radius,
-            envelope,
-            autoitem_idx,
-            screen_to_envelope,
-            envelope_to_screen,
-            get_envelope_properties,
-            value_for_insert
+            state, config, center_time, radius, envelope, autoitem_idx,
+            envelope_to_screen, value_for_insert
         )
     end
     local screen_pt_list = (active_seed_cache and active_seed_cache.screen_pt_list) or {}
@@ -1363,55 +1339,30 @@ function M.create_points_in_brush_area(state, config, mouse_x, mouse_y, radius, 
             end
         end
     else
-        -- Sample timeline across brush diameter; spacing derived from min pixel gap (screen X ~ proportional to time).
-        local step_target = abs_tr > 1e-18 and (min_space * 0.45 / pixel_width) * abs_tr or span_t
-        if step_target < 1e-24 or step_target ~= step_target then
-            step_target = span_t
-        end
-        if step_target > span_t then
-            step_target = span_t
-        end
-
-        local n = math.max(1, math.ceil(span_t / step_target))
-        if n > 256 then
-            n = 256
-        end
-        local actual_step = span_t / n
-        local t0 = center_time - math.abs(radius_time)
-
-        for k = 0, n do
-            local point_time = t0 + k * actual_step
-            local time_distance = math.abs(point_time - center_time)
-            local normalized_distance = math.abs(radius_time) > 1e-12 and (time_distance / math.abs(radius_time)) or 0
-
-            if normalized_distance <= 1.0 + 1e-9 then
-                local base_value, insert_t, eval_t = value_for_insert(envelope, point_time, autoitem_idx)
-                if base_value ~= nil and insert_t ~= nil and not insert_t_already_placed(placed_insert_t, insert_t, eps_ins) then
-                    local t_vis = eval_t or point_time
-                    local sx_c, sy_c = envelope_to_screen(t_vis, base_value, envelope)
-                    if sx_c and sy_c then
-                        local new_value = sanitize_raw_value(base_value, nil)
-                        if new_value == nil then
-                            goto continue_seed_insert
-                        end
-                        local sx, sy = envelope_to_screen(t_vis, new_value, envelope)
-                        if sx and sy then
-                            if min_space <= 0 or min_dist_to_point_list(sx, sy) >= min_space then
-                                local shape_in, tension = shape_and_tension_for_new_insert(
-                                    envelope, autoitem_idx, insert_t, default_point_shape, eps_ins
-                                )
-                                local selected, noSortIn = false, true
-                                if insert_envelope_point(envelope, autoitem_idx, insert_t, new_value, shape_in, tension, selected, noSortIn) then
-                                    points_created = points_created + 1
-                                    placed_insert_t[#placed_insert_t + 1] = insert_t
-                                    screen_pt_list[#screen_pt_list + 1] = { sx, sy }
-                                end
-                            end
+        local rim = collect_seed_insert_candidates(
+            center_time, radius_time, abs_tr, pixel_width, min_space,
+            envelope, autoitem_idx, envelope_to_screen, value_for_insert, true
+        )
+        if rim then
+            for i = 1, #rim do
+                local c = rim[i]
+                local insert_t = c.insert_t
+                local new_value = sanitize_raw_value(c.value, nil)
+                local sx, sy = c.sx, c.sy
+                if insert_t ~= nil and new_value ~= nil and sx and sy
+                    and not insert_t_already_placed(placed_insert_t, insert_t, eps_ins) then
+                    if min_space <= 0 or min_dist_to_point_list(sx, sy) >= min_space then
+                        local shape_in, tension = shape_and_tension_for_new_insert(
+                            envelope, autoitem_idx, insert_t, default_point_shape, eps_ins
+                        )
+                        if insert_envelope_point(envelope, autoitem_idx, insert_t, new_value, shape_in, tension, false, true) then
+                            points_created = points_created + 1
+                            placed_insert_t[#placed_insert_t + 1] = insert_t
+                            screen_pt_list[#screen_pt_list + 1] = { sx, sy }
                         end
                     end
                 end
             end
-            ::continue_seed_insert::
         end
     end
 
@@ -1421,32 +1372,6 @@ function M.create_points_in_brush_area(state, config, mouse_x, mouse_y, radius, 
     end
 
     return points_created
-end
-
---- Single InsertEnvelopePoint*. Caller should run Core.prepare_envelope_for_point_insert first (deps does).
---- Project time from screen_to_envelope X; value and insert time from value_for_insert (device SRATE/BSIZE + take remap when applicable).
-function M.insert_one_point_at_screen(envelope, autoitem_idx, mx, my, screen_to_envelope, value_for_insert, default_point_shape)
-    if not envelope or not screen_to_envelope or not value_for_insert then
-        return false
-    end
-    local t = screen_to_envelope(mx, my, envelope)
-    if not t then
-        return false
-    end
-    local v, ins_t, eval_t = value_for_insert(envelope, t, autoitem_idx)
-    if v == nil then
-        return false
-    end
-    if ins_t == nil then
-        return false
-    end
-    local shape_in, tension = shape_and_tension_for_new_insert(envelope, autoitem_idx, ins_t, default_point_shape)
-    local ok = insert_envelope_point(envelope, autoitem_idx, ins_t, v, shape_in, tension, false, false)
-    if ok then
-        sort_envelope_points(envelope, autoitem_idx)
-        reaper.UpdateArrange()
-    end
-    return ok
 end
 
 function M.refresh_captured_from_envelope(state, envelope, autoitem_idx)

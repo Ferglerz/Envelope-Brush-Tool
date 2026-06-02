@@ -12,6 +12,10 @@ for k, v in pairs(EnvApi) do
     M[k] = v
 end
 
+M.track_autoitem_idx = Util.track_autoitem_idx
+M.brush_tool_active = Util.brush_tool_active
+M.brush_lmb_may_start_stroke = Util.brush_lmb_may_start_stroke
+
 function M.new_state(config)
     local b, f, s = config.brush, config.falloff, config.sculpt
     return {
@@ -52,18 +56,16 @@ function M.new_state(config)
         captured_points = {},
         --- Smooth LMB stroke: project times of every point that entered the brush (merge scope on release).
         smooth_stroke_point_times = nil,
-        last_create_client = nil,
+        --- Cached SWS cursor time for one defer tick (set in main_loop before envelope ops).
+        _brush_center_time = nil,
 
         -- Envelope context (REAPER: autoitem_idx -1 = parent lane; >=0 = automation item on that envelope)
         target_envelope = nil,
         envelope_autoitem_idx = -1,
         envelope_bounds = {top = 150, bottom = 600, left = 200, right = 1200},
-        overlay_visible = false,
         sws_hover_detected = false,
         --- True when cursor is in the target envelope lane (Y + SWS envelope context). Gates HUD, LMB, and point ops.
         envelope_lane_hover = false,
-        --- True when cursor is near the envelope curve within the lane (proximity hit-test).
-        envelope_curve_hover = false,
 
         -- Cached envelope properties
         cached_envelope_properties = {
@@ -77,10 +79,6 @@ function M.new_state(config)
         -- Per-frame cache (arrange view)
         frame_arrange_start = 0,
         frame_arrange_end = 0,
-
-        -- Main window client size for overlay
-        client_w = 2000,
-        client_h = 2000,
 
         -- Last raw client rect from JS_Window_GetClientRect (for setup_envelope_bounds skip-if-unchanged)
         _arrange_client_rect_key = nil,
@@ -160,18 +158,6 @@ function M.clamp(value, min_val, max_val)
     return Util.clamp(value, min_val, max_val)
 end
 
-function M.track_autoitem_idx(state)
-    return Util.track_autoitem_idx(state)
-end
-
-function M.brush_tool_active(state)
-    return Util.brush_tool_active(state)
-end
-
-function M.brush_lmb_may_start_stroke(state)
-    return Util.brush_lmb_may_start_stroke(state)
-end
-
 --- While sculpt_sort_pending: sort at most every ENVELOPE_SORT_INTERVAL_SEC.
 --- If last_envelope_sort_os is nil (e.g. after target reset), sort on the next due call. LMB sets it to "now" so the
 --- first sculpt tick does not also pay for a full Envelope_SortPoints (see input.on_lmb_pressed).
@@ -186,16 +172,12 @@ function M.tick_throttled_envelope_sort_if_due(state, config, ops)
         return false
     end
     if ops and ops.sort_envelope_points_for_autoitem then
-        ops.sort_envelope_points_for_autoitem(state.target_envelope, M.track_autoitem_idx(state))
+        ops.sort_envelope_points_for_autoitem(state.target_envelope, Util.track_autoitem_idx(state))
     end
     state.last_envelope_sort_os = now
     state.envelope_points_dirty_sort = false
     reaper.UpdateArrange()
     return true
-end
-
-function M.falloff_strength_percent(strength, _config)
-    return 100 * (strength or 0)
 end
 
 function M.clamp_falloff_strength(strength, config)
@@ -208,10 +190,6 @@ function M.falloff_wheel_step(config, fine_mul)
     local pct = f.FALLOFF_STRENGTH_PERCENT_STEP or 1
     fine_mul = fine_mul or 1
     return (pct / 100) * fine_mul
-end
-
-function M.sculpt_power_percent(power, _config)
-    return 100 * (power or 0)
 end
 
 function M.clamp_sculpt_power(power, config)

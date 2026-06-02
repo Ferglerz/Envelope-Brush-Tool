@@ -3,8 +3,11 @@ local M = {}
 local _mod_dir = (((debug.getinfo(1, "S").source or ""):match("^@(.+)$")) or ""):match("^(.*[\\/])") or ""
 local Path = dofile(_mod_dir .. "path.lua")
 local Util = Path.load_from_modules("util.lua")
-local Mods = Path.load_from_modules("mods.lua")
 local ActionShortcuts = Path.load_from_modules("action_shortcuts.lua")
+
+local JS_CTRL, JS_CMD, JS_SHIFT = 4, 16, 8
+local VK_MENU = 0x12
+local MK_SHIFT, MK_CONTROL = 0x0004, 0x0008
 local EnvApi = Path.load_from_modules("envelope/envelope_api.lua")
 
 local function imgui_mouse_wheel_sum(state)
@@ -15,7 +18,7 @@ local function imgui_mouse_wheel_sum(state)
     return w
 end
 
---- Wheel modifiers: js_ReaScript JS_Mouse_GetState (global), not ImGui_GetKeyMods; WM wParam masks in mods.lua.
+--- Wheel modifiers: js_ReaScript JS_Mouse_GetState (global), not ImGui_GetKeyMods; WM wParam MK_* masks below.
 local VK_ESCAPE = 0x1B
 local VK_X = 0x58
 local VK_Y = 0x59
@@ -26,7 +29,7 @@ local function js_mod_down(bit)
 end
 
 local function sculpt_modifier_down_js()
-    return js_mod_down(Mods.JS_CTRL) or js_mod_down(Mods.JS_CMD)
+    return js_mod_down(JS_CTRL) or js_mod_down(JS_CMD)
 end
 
 --- Sculpt: Cmd or Ctrl. Smooth: Shift. Sculpt wins when combined with Shift.
@@ -34,7 +37,7 @@ function M.resolve_brush_drag_kind()
     if sculpt_modifier_down_js() then
         return "sculpt"
     end
-    if js_mod_down(Mods.JS_SHIFT) then
+    if js_mod_down(JS_SHIFT) then
         return "smooth"
     end
     return "nudge"
@@ -42,17 +45,17 @@ end
 
 local function wheel_mod_alt()
     if not reaper.JS_Mouse_GetState then return false end
-    return (reaper.JS_Mouse_GetState(Mods.VK_MENU) or 0) > 0
+    return (reaper.JS_Mouse_GetState(VK_MENU) or 0) > 0
 end
 
 local function wheel_mod_shift(arrange_wparam_lo)
     local js = false
     if reaper.JS_Mouse_GetState then
-        js = (reaper.JS_Mouse_GetState(Mods.JS_SHIFT) or 0) > 0
+        js = (reaper.JS_Mouse_GetState(JS_SHIFT) or 0) > 0
     end
     if arrange_wparam_lo then
         local lo = arrange_wparam_lo & 0xFFFF
-        if (lo & Mods.MK_SHIFT) ~= 0 then return true end
+        if (lo & MK_SHIFT) ~= 0 then return true end
     end
     return js
 end
@@ -60,13 +63,13 @@ end
 local function wheel_mod_power_cmd_ctrl(arrange_wparam_lo)
     local js = false
     if reaper.JS_Mouse_GetState then
-        local a = reaper.JS_Mouse_GetState(Mods.JS_CTRL) or 0
-        local b = reaper.JS_Mouse_GetState(Mods.JS_CMD) or 0
+        local a = reaper.JS_Mouse_GetState(JS_CTRL) or 0
+        local b = reaper.JS_Mouse_GetState(JS_CMD) or 0
         js = a > 0 or b > 0
     end
     if arrange_wparam_lo then
         local lo = arrange_wparam_lo & 0xFFFF
-        if (lo & Mods.MK_CONTROL) ~= 0 then return true end
+        if (lo & MK_CONTROL) ~= 0 then return true end
     end
     return js
 end
@@ -146,10 +149,6 @@ local function mark_stroke_undo_dirty(state)
     state.envelope_stroke_dirty = true
 end
 
-local function stroke_time_key(t)
-    return math.floor(t * 1e9 + 0.5)
-end
-
 local function note_smooth_stroke_capture(state, captured_points)
     if not captured_points or #captured_points == 0 then
         return
@@ -161,7 +160,7 @@ local function note_smooth_stroke_capture(state, captured_points)
     for i = 1, #captured_points do
         local t = captured_points[i].original_time
         if type(t) == "number" and t == t then
-            map[stroke_time_key(t)] = t
+            map[Util.stroke_time_key(t)] = t
         end
     end
 end
@@ -178,7 +177,6 @@ local function clear_drag_pointer_state(state)
     state.brush_lmb_press_armed = false
     state.captured_points = {}
     state.smooth_stroke_point_times = nil
-    state.last_create_client = nil
     state.sculpt_last_client = nil
     state.active_sculpt_kind = nil
 end

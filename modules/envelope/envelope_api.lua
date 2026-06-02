@@ -22,38 +22,7 @@ function M.envelope_value_at_time(envelope, time_pos)
     return nil
 end
 
---- Insert path: device SRATE + BSIZE (as samplesRequested), matching common Insert-at-mouse scripts. Caps BSIZE to avoid huge Evaluate requests.
-local ENVELOPE_INSERT_EVAL_MAX_SAMPLES = 8192
-
-function M.envelope_evaluate_device_params()
-    local sr = 44100
-    local n = 512
-    if reaper.GetAudioDeviceInfo then
-        local _, srate_str = reaper.GetAudioDeviceInfo("SRATE")
-        if type(srate_str) == "string" then
-            local x = tonumber(srate_str)
-            if x and x > 0 and x == x then
-                sr = x
-            end
-        end
-        local _, bsize_str = reaper.GetAudioDeviceInfo("BSIZE")
-        if type(bsize_str) == "string" then
-            local x = tonumber(bsize_str)
-            if x and x >= 1 and x == x then
-                n = math.floor(x)
-            end
-        end
-    end
-    if n < 1 then
-        n = 1
-    end
-    if n > ENVELOPE_INSERT_EVAL_MAX_SAMPLES then
-        n = ENVELOPE_INSERT_EVAL_MAX_SAMPLES
-    end
-    return sr, n
-end
-
---- SWS BR_EnvAlloc: pass true for take (item) envelopes so min/max and flags match the lane.
+--- Take envelopes are out of scope (hover rejects them); used only to discard SWS take hits.
 function M.envelope_is_take_envelope(envelope)
     if not envelope then return false end
     local proj = reaper.EnumProjects and reaper.EnumProjects(-1) or 0
@@ -87,46 +56,40 @@ function M.envelope_has_automation_items(envelope, state)
     return has
 end
 
---- Returns insert_time, evaluate_time for Envelope_Evaluate / InsertEnvelopePoint*.
---- Track + automation item: project timeline for both. Take envelope (parent lane only): evaluate at project_time - item position; insert time multiplies by take playrate (ReaScript insert pattern).
-function M.envelope_insert_evaluate_times(envelope, project_time, autoitem_idx)
+--- Value for new points from REAPER evaluator (linear domain). Returns linear value, insert_time (project timeline).
+function M.envelope_value_for_insert(envelope, project_time, _autoitem_idx)
     if not envelope or project_time == nil then
         return nil, nil
     end
-    if type(autoitem_idx) == "number" and autoitem_idx >= 0 then
-        return project_time, project_time
+    local value_linear = M.envelope_value_at_time(envelope, project_time)
+    if value_linear == nil or type(value_linear) ~= "number" or value_linear ~= value_linear then
+        return nil, project_time
     end
-    if M.envelope_is_take_envelope(envelope) then
-        local proj = reaper.EnumProjects and reaper.EnumProjects(-1) or 0
-        local take = reaper.GetEnvelopeInfo_Value(envelope, "P_TAKE")
-        if take and take ~= 0 and reaper.ValidatePtr2 and reaper.ValidatePtr2(proj, take, "MediaItem_Take*") then
-            local item = reaper.GetMediaItemTake_Item(take)
-            if item and reaper.ValidatePtr2 and reaper.ValidatePtr2(proj, item, "MediaItem*") then
-                local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
-                local playrate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
-                if type(pos) == "number" and type(playrate) == "number" and playrate ~= 0 and playrate == playrate then
-                    local eval_t = project_time - pos
-                    local ins_t = eval_t * playrate
-                    return ins_t, eval_t
-                end
-            end
-        end
-    end
-    return project_time, project_time
+    return value_linear, project_time
 end
 
---- Value for new points from REAPER evaluator (linear domain, shape/scaling aware).
---- Returns linear_value_for_insert, insert_time, evaluate_time (all nil on failure).
-function M.envelope_value_for_insert(envelope, project_time, autoitem_idx)
-    local insert_t, eval_t = M.envelope_insert_evaluate_times(envelope, project_time, autoitem_idx)
-    if insert_t == nil or eval_t == nil then
-        return nil, nil, nil
+function M.count_envelope_points(envelope, autoitem_idx)
+    return reaper.CountEnvelopePointsEx(envelope, autoitem_idx or -1)
+end
+
+function M.get_envelope_point(envelope, autoitem_idx, i)
+    local ok, t, v, shape, tension, selected = reaper.GetEnvelopePointEx(envelope, autoitem_idx or -1, i)
+    if not ok then
+        return false, nil, nil, shape, tension, selected
     end
-    local value_linear = M.envelope_value_at_time(envelope, eval_t)
-    if value_linear == nil or type(value_linear) ~= "number" or value_linear ~= value_linear then
-        return nil, insert_t, eval_t
-    end
-    return value_linear, insert_t, eval_t
+    return true, t, ValueScaling.api_value_to_linear(envelope, v), shape, tension, selected
+end
+
+function M.set_envelope_point(envelope, autoitem_idx, i, t, v, shape, tension, sel, no_sort)
+    return reaper.SetEnvelopePointEx(envelope, autoitem_idx or -1, i, t, ValueScaling.linear_value_to_api(envelope, v), shape, tension, sel, no_sort)
+end
+
+function M.insert_envelope_point(envelope, autoitem_idx, t, v, shape, tension, sel, no_sort)
+    return reaper.InsertEnvelopePointEx(envelope, autoitem_idx or -1, t, ValueScaling.linear_value_to_api(envelope, v), shape, tension, sel, no_sort)
+end
+
+function M.sort_envelope_points(envelope, autoitem_idx)
+    reaper.Envelope_SortPointsEx(envelope, autoitem_idx or -1)
 end
 
 --- Default point shape from envelope state chunk (DEFSHAPE <n> ...); fallback 0. Caches per `state` + envelope pointer.
@@ -338,7 +301,7 @@ function M.get_envelope_properties(state, envelope)
         return c.min_val, c.max_val, c.center_val, c.scaling_mode
     end
 
-    local br_env = reaper.BR_EnvAlloc(envelope, M.envelope_is_take_envelope(envelope))
+    local br_env = reaper.BR_EnvAlloc(envelope, false)
     if not br_env then return nil, nil, nil, nil end
     -- Return order per SWS BR_ReaScript.cpp: ... centerValue, type, faderScaling, AIoptions
     local _, _, _, _, _, _, min_val, max_val, center_val = reaper.BR_EnvGetProperties(br_env)
@@ -359,7 +322,7 @@ end
 
 function M.is_envelope_lane_visible(envelope)
     if not envelope then return false end
-    local br_env = reaper.BR_EnvAlloc(envelope, M.envelope_is_take_envelope(envelope))
+    local br_env = reaper.BR_EnvAlloc(envelope, false)
     if not br_env then return false end
     -- BR_EnvGetProperties returns: active, visible, armed, ...
     -- Use the 2nd value (visible), not armed.
@@ -386,7 +349,7 @@ function M.prepare_envelope_for_point_insert(envelope)
     if not reaper.BR_EnvAlloc or not reaper.BR_EnvGetProperties or not reaper.BR_EnvSetProperties or not reaper.BR_EnvFree then
         return
     end
-    local br = reaper.BR_EnvAlloc(envelope, M.envelope_is_take_envelope(envelope))
+    local br = reaper.BR_EnvAlloc(envelope, false)
     if not br then return end
     local a, vis, armed, inLane, lh, dsh, minv, maxv, cval, etype, fsc, aiopt = reaper.BR_EnvGetProperties(br)
     if a == nil then a = true end
@@ -476,10 +439,12 @@ function M.brush_target_location_label(_state, envelope, autoitem_idx)
 end
 
 function M.clear_target_envelope_state_only(state)
+    if state.target_envelope then
+        ValueScaling.invalidate(state.target_envelope)
+    end
     state.target_envelope = nil
     state.envelope_autoitem_idx = -1
     state.envelope_lane_hover = false
-    state.envelope_curve_hover = false
     state.brush_stroke_committed = false
     state.brush_lmb_press_armed = false
     state.envelope_ai_lane_cache = nil
